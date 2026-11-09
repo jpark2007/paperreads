@@ -39,9 +39,12 @@ struct NotesPanel: View {
         }
         .background(Theme.bg)
         .onChange(of: paper.paperNotes) { scheduleSave() }
-        .onDisappear {
-            saveTask?.cancel()
-            try? context.save()
+        // Highlight notes are edited in child rows; debounce-save them the same way.
+        .onChange(of: highlights.map(\.note)) { scheduleSave() }
+        .onDisappear { saveNow() }
+        // ⌘Q inside the debounce window: flush synchronously before the process exits.
+        .onReceive(NotificationCenter.default.publisher(for: NSApplication.willTerminateNotification)) { _ in
+            saveNow()
         }
     }
 
@@ -50,6 +53,12 @@ struct NotesPanel: View {
         DispatchQueue.main.async {
             withAnimation(.easeInOut(duration: 0.25)) { proxy.scrollTo(id, anchor: .center) }
         }
+    }
+
+    private func saveNow() {
+        saveTask?.cancel()
+        saveTask = nil
+        if context.hasChanges { try? context.save() }
     }
 
     private func scheduleSave() {
