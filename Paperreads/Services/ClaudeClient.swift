@@ -154,8 +154,8 @@ struct SSEEvent {
     var data: String
 }
 
-/// Line-oriented SSE parser. `URLSession.AsyncBytes.lines` does not reliably deliver the blank
-/// separator lines, so an event is dispatched when (a) a blank line arrives, (b) a new `event:`
+/// Line-oriented SSE parser (fed LF-split lines by `consume`). Blank separator lines are not relied on,
+/// so an event is dispatched when (a) a blank line arrives, (b) a new `event:`
 /// field starts while data is pending, or (c) the accumulated `data:` payload is already a
 /// complete JSON document. Multi-line `data:` fields are joined with "\n" per the SSE spec.
 struct SSEParser {
@@ -236,9 +236,13 @@ struct MessageAccumulator {
         let trimmed = event.data.trimmingCharacters(in: .whitespacesAndNewlines)
         if trimmed.isEmpty || trimmed == "[DONE]" { return .none }
         guard let obj = (try? JSONSerialization.jsonObject(with: Data(trimmed.utf8))) as? [String: Any] else {
-            // Non-JSON payloads are ignored unless they claim to be an error.
-            if event.event == "error" { throw ClaudeError(type: "stream_error", message: trimmed) }
-            return .none
+            // A payload that is not valid JSON means the event was corrupted in transit or framing;
+            // dropping it would silently lose a delta (and break a thinking signature), so fail.
+            if event.event == "ping" { return .none }
+            throw ClaudeError(type: "stream_error",
+                              message: event.event == "error"
+                                ? String(trimmed.prefix(500))
+                                : "Claude's response stream was malformed. Please try again.")
         }
         let type = (obj["type"] as? String) ?? event.event ?? ""
 
@@ -354,7 +358,14 @@ struct ClaudeClient {
     static let betaHeader = "server-side-fallback-2026-07-01"
     static let userAgent = "Paperreads/0.1 (personal research reader)"
 
-    static let maxPDFBytes = 32 * 1024 * 1024
+    /// The Messages API caps the whole request at 32 MB. The PDF travels as base64 (4/3 its size)
+    /// next to the prompt, so the raw limit is what still fits after encoding plus 64 KB overhead
+    /// (about 23.9 MB).
+    static let maxRequestBytes = 32 * 1024 * 1024
+    static let requestOverheadBytes = 64 * 1024
+    static let maxPDFBytes = (maxRequestBytes - requestOverheadBytes) / 4 * 3
+
+    static func base64Size(_ rawBytes: Int) -> Int { (rawBytes + 2) / 3 * 4 }
     static let maxPDFPages = 600
 
     /// Dedicated session: 600s idle timeout (long thinking pauses), no caching, no cookies.
@@ -404,10 +415,11 @@ struct ClaudeClient {
         guard !pdfData.isEmpty else {
             throw ClaudeError(type: "invalid_pdf", message: "The PDF is empty.")
         }
-        guard pdfData.count <= Self.maxPDFBytes else {
+        guard Self.base64Size(pdfData.count) + Self.requestOverheadBytes <= Self.maxRequestBytes else {
             let mb = Double(pdfData.count) / 1_048_576
+            let limit = Double(Self.maxPDFBytes) / 1_048_576
             throw ClaudeError(type: "pdf_too_large",
-                              message: String(format: "This PDF is %.1f MB; Claude accepts PDFs up to 32 MB.", mb))
+                              message: String(format: "This PDF is %.1f MB; at most %.1f MB can be sent to Claude (the 32 MB request limit includes base64 encoding).", mb, limit))
         }
         let pages: Int
         if let pageCount {
@@ -573,11 +585,26 @@ struct ClaudeClient {
             }
         }
 
+        // Split on LF only (stripping a trailing CR), as the SSE spec defines line terminators.
+        // `AsyncBytes.lines` also breaks on U+0085/U+2028/U+2029, which JSON allows raw inside
+        // strings, and would split (and silently corrupt) a delta that contains one.
         var finished = false
-        lineLoop: for try await line in bytes.lines {
+        var lineBuffer: [UInt8] = []
+        lineBuffer.reserveCapacity(4096)
+        byteLoop: for try await byte in bytes {
+            guard byte == 0x0A else { lineBuffer.append(byte); continue }
             try Task.checkCancellation()
+            if lineBuffer.last == 0x0D { lineBuffer.removeLast() }
+            let line = String(decoding: lineBuffer, as: UTF8.self)
+            lineBuffer.removeAll(keepingCapacity: true)
             for event in parser.feed(line) {
-                if try handle(event) { finished = true; break lineLoop }
+                if try handle(event) { finished = true; break byteLoop }
+            }
+        }
+        if !finished, !lineBuffer.isEmpty {
+            if lineBuffer.last == 0x0D { lineBuffer.removeLast() }
+            for event in parser.feed(String(decoding: lineBuffer, as: UTF8.self)) {
+                if try handle(event) { finished = true; break }
             }
         }
         if !finished, let tail = parser.finish() {

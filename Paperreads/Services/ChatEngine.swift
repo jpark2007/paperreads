@@ -37,6 +37,10 @@ final class ChatEngine: ObservableObject {
     /// Streaming text is published to the UI at most this often (deltas are coalesced).
     private static let streamPublishInterval: Duration = .milliseconds(50)
     private static let maxTokens = 16000
+    /// One top-level effort for every request (Ask and Explain alike): changing `effort`
+    /// between turns invalidates the prompt cache, and the conversation is designed to be read
+    /// back from cache on every turn.
+    private static let effort = "medium"
     private static let retrievalCount = 6
     private static let maxRetrievedChars = 1200
     private static let maxQuestionChars = 20_000
@@ -84,8 +88,7 @@ final class ChatEngine: ObservableObject {
         let q = question.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !q.isEmpty else { return }
         let clipped = String(q.prefix(Self.maxQuestionChars))
-        send(question: clipped, retrievalQuery: clipped, kind: "ask", effort: "medium",
-             display: clipped)
+        send(question: clipped, retrievalQuery: clipped, kind: "ask", display: clipped)
     }
 
     func explain(_ selection: ReaderSelection) {
@@ -100,8 +103,7 @@ final class ChatEngine: ObservableObject {
         (Located at [b\(selection.blockIndex)]; surrounding text: \(surrounding))
         """
         let display = "Explain:\n\n> " + quote.replacingOccurrences(of: "\n", with: "\n> ")
-        send(question: question, retrievalQuery: quote, kind: "explain", effort: "low",
-             display: display)
+        send(question: question, retrievalQuery: quote, kind: "explain", display: display)
     }
 
     func newConversation() {
@@ -124,7 +126,7 @@ final class ChatEngine: ObservableObject {
 
     // MARK: Sending
 
-    private func send(question: String, retrievalQuery: String, kind: String, effort: String, display: String) {
+    private func send(question: String, retrievalQuery: String, kind: String, display: String) {
         guard task == nil else { return }               // one request at a time
         errorText = nil
 
@@ -201,7 +203,7 @@ final class ChatEngine: ObservableObject {
             "max_tokens": Self.maxTokens,
             "system": ClaudeRawJSON(data: system),
             "messages": history,
-            "output_config": ["effort": effort],
+            "output_config": ["effort": Self.effort],
         ]
 
         generation += 1
@@ -246,6 +248,14 @@ final class ChatEngine: ObservableObject {
 
         if stopReason == "refusal" {
             fail(gen: gen, error: ClaudeError.refusal)
+            return
+        }
+
+        // An empty content array cannot be replayed as a non-final message (the API rejects
+        // it), so storing it would break every later request in this conversation.
+        if Self.isEmptyContent(contentJSON) {
+            fail(gen: gen, error: ClaudeError(type: "empty_response",
+                                              message: "Claude returned an empty answer. Please try again."))
             return
         }
 
@@ -337,8 +347,10 @@ final class ChatEngine: ObservableObject {
 
         // A trailing unanswered user turn (app quit mid-request) would break role alternation
         // on replay; it is the tail, so removing it keeps the history append-only.
+        // A trailing assistant turn with empty content (stored by an older build) would be
+        // rejected on replay; drop it along with the user turn it answered.
         var removedTail = false
-        while let last = loaded.last, last.role == "user" {
+        while let last = loaded.last, last.role == "user" || Self.isEmptyContent(last.contentJSON) {
             context.delete(last)
             loaded.removeLast()
             removedTail = true
@@ -348,6 +360,12 @@ final class ChatEngine: ObservableObject {
         conversationId = cid
         turns = loaded
         messages = loaded.map(Self.display)
+    }
+
+    /// True when stored content is an empty JSON array (or not an array at all).
+    private static func isEmptyContent(_ json: Data) -> Bool {
+        guard let arr = (try? JSONSerialization.jsonObject(with: json)) as? [Any] else { return true }
+        return arr.isEmpty
     }
 
     private static func display(_ turn: ChatTurn) -> ChatDisplayMessage {

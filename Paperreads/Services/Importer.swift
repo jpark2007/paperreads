@@ -1,6 +1,7 @@
 import Foundation
 import PDFKit
 import SwiftData
+import CryptoKit
 
 // Module C — import pipeline (docs/ARCHITECTURE.md §3).
 //
@@ -234,7 +235,7 @@ final class Importer: ObservableObject {
 
     private static let placeholderPrefix = "Importing "
     nonisolated private static let maxLocalPDFBytes = HTTP.maxPDFBytes
-    private static let maxConvertPDFBytes = 32 * 1024 * 1024
+    private static let maxConvertPDFBytes = ClaudeClient.maxPDFBytes
     private static let maxConvertPages = 600
 
     private init() {}
@@ -525,21 +526,33 @@ final class Importer: ObservableObject {
         try update(id, ctx, .fetching, "Fetching arXiv text…")
         if let (html, finalURL) = try await fetchArxivHTML(arxivId) {
             try update(id, ctx, .converting, "Preparing clean text…")
-            let result = try await WebProcessor.shared.ingestArxivHTML(html, baseURL: finalURL)
-            try await finish(id, ctx, result, kind: .arxivHTML)
-
-            // Keep a copy of the PDF for the PDF view (non-fatal).
-            if let p = paper(id, ctx), !p.hasPDF {
-                if let url = URL(string: "https://arxiv.org/pdf/\(arxivId)"),
-                   let data = try? await downloadPDF(url) {
-                    try? await writePDF(data, id, ctx)
-                }
+            let result: IngestResult?
+            do {
+                result = try await WebProcessor.shared.ingestArxivHTML(html, baseURL: finalURL)
+            } catch is CancellationError {
+                throw CancellationError()
+            } catch {
+                // The HTML route failed (timeout, script error, crashed web process): the PDF
+                // route below can still produce readable text, so fall through to it.
                 try Task.checkCancellation()
+                result = nil
             }
-            return
+            if let result {
+                try await finish(id, ctx, result, kind: .arxivHTML)
+
+                // Keep a copy of the PDF for the PDF view (non-fatal).
+                if let p = paper(id, ctx), !p.hasPDF {
+                    if let url = URL(string: "https://arxiv.org/pdf/\(arxivId)"),
+                       let data = try? await downloadPDF(url) {
+                        try? await writePDF(data, id, ctx)
+                    }
+                    try Task.checkCancellation()
+                }
+                return
+            }
         }
 
-        // No LaTeXML HTML: fall back to the PDF.
+        // No usable LaTeXML HTML: fall back to the PDF.
         if try require(id, ctx).hasPDF == false {
             try update(id, ctx, .fetching, "Downloading PDF…")
             guard let url = URL(string: "https://arxiv.org/pdf/\(arxivId)") else { throw ImportError.missingPDF }
@@ -588,7 +601,7 @@ final class Importer: ObservableObject {
         let pdfFile = PaperStore.pdfURL(id)
         let maxBytes = Self.maxConvertPDFBytes
         let maxPages = Self.maxConvertPages
-        let (data, pageCount): (Data, Int) = try await Task.detached(priority: .userInitiated) {
+        let (data, pageCount, pdfHash): (Data, Int, String) = try await Task.detached(priority: .userInitiated) {
             let attrs = try? FileManager.default.attributesOfItem(atPath: pdfFile.path)
             let size = (attrs?[.size] as? NSNumber)?.intValue ?? 0
             guard size > 0 else { throw ImportError.missingPDF }
@@ -597,9 +610,38 @@ final class Importer: ObservableObject {
             guard Importer.looksLikePDF(d) else { throw ImportError.notAPDF }
             guard let doc = PDFDocument(data: d) else { throw ImportError.unreadableFile }
             if doc.pageCount > maxPages { throw ImportError.pdfTooLong(doc.pageCount) }
-            return (d, doc.pageCount)
+            let hash = SHA256.hash(data: d).map { String(format: "%02x", $0) }.joined()
+            return (d, doc.pageCount, hash)
         }.value
 
+        // A conversion already paid for this exact PDF (e.g. a later step failed, or the app quit
+        // while preparing text) is reused instead of converting again.
+        let pdfSize = data.count
+        let saved: (markdown: String, isComplete: Bool)? = await Task.detached(priority: .userInitiated) {
+            PaperStore.readSavedConversion(id, pdfSize: pdfSize, pdfSHA256: pdfHash)
+        }.value
+        try Task.checkCancellation()
+        let md: String
+        let isComplete: Bool
+        if let saved {
+            md = saved.markdown
+            isComplete = saved.isComplete
+        } else {
+            (md, isComplete) = try await convert(id, ctx, data: data, pageCount: pageCount, pdfHash: pdfHash)
+        }
+
+        try update(id, ctx, .converting, "Preparing clean text…")
+        let result = try await WebProcessor.shared.ingestMarkdown(md)
+        try await finish(id, ctx, result, kind: .claudeMarkdown)
+        if !isComplete, let p = paper(id, ctx) {
+            p.importStatusDetail = "Text incomplete — the PDF was too long to convert in one pass."
+            save(ctx)
+        }
+    }
+
+    /// Runs the paid Claude conversion and saves source.md + its sidecar for reuse on retry.
+    private func convert(_ id: UUID, _ ctx: ModelContext, data: Data, pageCount: Int,
+                         pdfHash: String) async throws -> (String, Bool) {
         try update(id, ctx, .converting, "Converting PDF with Claude…")
         let throttle = SaveThrottle()
         let conversion = try await ClaudeClient().convertPDF(pdfData: data, pageCount: pageCount) { [weak self] progress in
@@ -622,19 +664,13 @@ final class Importer: ObservableObject {
         }
 
         _ = try require(id, ctx)
-        let mdURL = PaperStore.markdownURL(id)
         let mdCopy = md
+        let info = PaperStore.SourceConversionInfo(pdfSize: data.count, pdfSHA256: pdfHash,
+                                                   isComplete: conversion.isComplete)
         try await Task.detached(priority: .userInitiated) {
-            try Data(mdCopy.utf8).write(to: mdURL, options: .atomic)
+            try PaperStore.writeSavedConversion(id, markdown: mdCopy, info: info)
         }.value
-
-        try update(id, ctx, .converting, "Preparing clean text…")
-        let result = try await WebProcessor.shared.ingestMarkdown(md)
-        try await finish(id, ctx, result, kind: .claudeMarkdown)
-        if !conversion.isComplete, let p = paper(id, ctx) {
-            p.importStatusDetail = "Text incomplete — the PDF was too long to convert in one pass."
-            save(ctx)
-        }
+        return (md, conversion.isComplete)
     }
 
     // 4. Save content → ready.

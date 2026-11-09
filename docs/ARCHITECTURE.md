@@ -86,7 +86,7 @@ Pipeline (each step updates `paper.importState` + `importStatusDetail`, saves co
 3. **PDF path** (`converting`): `ClaudeClient.convertPDF(pdfData:pageCount:onProgress:)` →
    `PDFConversion`; if `!isComplete` (stopped at max_tokens / context window) append a visible
    "Conversion incomplete" blockquote and set `importStatusDetail` after ready (fail only if no
-   text at all). Save `source.md`; `WebProcessor.ingestMarkdown(md)`. `contentKind = .claudeMarkdown`.
+   text at all). Save `source.md` plus `source.json` (PDF size, SHA-256, isComplete); a retry on the same PDF reuses it instead of converting again. PDFs are limited to ~23.9 MB raw so the base64 request stays under the 32 MB API cap. `WebProcessor.ingestMarkdown(md)`. If arXiv HTML ingest fails, the arXiv path falls back to this PDF route. `contentKind = .claudeMarkdown`.
    If title unknown (placeholder or file name), use IngestResult.title.
 4. Save content via `PaperStore.writeContent`. State → `ready` (reader usable now).
 5. **References** (`referencesState = fetching`, runs after ready, non-blocking): Semantic
@@ -208,8 +208,9 @@ struct ChatDisplayMessage: Codable, Identifiable, Equatable { let id: UUID; let 
   cite paper passages as `[b12]` and cited works as `[r3]`; explain math step by step with
   LaTeX (`$…$`, `$$…$$`); say when something is not in the paper/sources; be concise.
 - Each user turn content = [optional text block "Related cited works (retrieved):\n[r3] Title (year): abstract…" (top 6 from `Retriever.search`) , text block with the question].
-  For explain: question = "Explain this passage in context. Define terms and unpack any math:\n> {quote}\n(Located at [b{blockIndex}]; surrounding text: {contextText})", effort low.
-  Ask uses effort medium.
+  For explain: question = "Explain this passage in context. Define terms and unpack any math:\n> {quote}\n(Located at [b{blockIndex}]; surrounding text: {contextText})".
+  Ask and Explain both use top-level effort "medium" (constant per conversation: changing
+  `effort` between turns invalidates the prompt cache).
 - `messages` = all prior `ChatTurn.contentJSON` for this conversation in `seq` order, verbatim,
   then the new user turn. Persist the user turn BEFORE sending and the assistant turn's exact
   content blocks after `done`. If a request fails, delete only the just-added unanswered user

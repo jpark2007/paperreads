@@ -7,6 +7,11 @@ struct ReaderView: View {
     @ObservedObject var session: PaperSession
     @EnvironmentObject private var app: AppCommands
 
+    /// The paper whose PDF layer has been shown at least once. The PDF view then stays alive
+    /// (hidden) across Text/PDF toggles, so the document is not re-parsed on the main thread
+    /// and the scroll position is kept.
+    @State private var pdfLayerPaper: UUID?
+
     private var paper: Paper { session.paper }
 
     var body: some View {
@@ -17,13 +22,19 @@ struct ReaderView: View {
                 textLayer
                     .opacity(app.readerMode == .text ? 1 : 0)
                     .allowsHitTesting(app.readerMode == .text)
-                if app.readerMode == .pdf {
+                if app.readerMode == .pdf || pdfLayerPaper == paper.id {
                     pdfLayer
+                        .opacity(app.readerMode == .pdf ? 1 : 0)
+                        .allowsHitTesting(app.readerMode == .pdf)
+                        .accessibilityHidden(app.readerMode != .pdf)
                 }
             }
             .frame(maxWidth: .infinity, maxHeight: .infinity)
         }
         .background(Theme.bg)
+        .onAppear { if app.readerMode == .pdf { pdfLayerPaper = paper.id } }
+        .onChange(of: app.readerMode) { if app.readerMode == .pdf { pdfLayerPaper = paper.id } }
+        .onChange(of: paper.id) { pdfLayerPaper = app.readerMode == .pdf ? paper.id : nil }
     }
 
     // MARK: Text
@@ -58,7 +69,7 @@ struct ReaderView: View {
     @ViewBuilder
     private var pdfLayer: some View {
         if paper.hasPDF {
-            PDFKitView(url: PaperStore.pdfURL(paper.id))
+            PDFKitView(url: PaperStore.pdfURLForReading(paper.id))
                 .background(Theme.bg)
         } else {
             ReaderMessage(
@@ -79,6 +90,8 @@ private struct ReaderTextContent: View {
     let page: URL
     @EnvironmentObject private var app: AppCommands
     @Query private var highlights: [Highlight]
+    /// Paper whose text kept crashing the web content process (reloading has stopped).
+    @State private var crashedPaper: UUID?
 
     init(paper: Paper, session: PaperSession, page: URL) {
         self.paper = paper
@@ -90,6 +103,23 @@ private struct ReaderTextContent: View {
     }
 
     var body: some View {
+        if crashedPaper == paper.id {
+            ReaderMessage(
+                label: "Text unavailable",
+                message: "This paper's text could not be displayed — the text view kept crashing."
+                    + (paper.hasPDF ? " View the PDF instead." : ""),
+                isError: true,
+                actionTitle: paper.hasPDF ? "View PDF" : "Try again",
+                action: {
+                    if paper.hasPDF { app.readerMode = .pdf } else { crashedPaper = nil }
+                }
+            )
+        } else {
+            reader
+        }
+    }
+
+    private var reader: some View {
         WebReader(
             page: page,
             paperID: paper.id,
@@ -97,7 +127,8 @@ private struct ReaderTextContent: View {
             highlights: highlights.filter { $0.paperId == paper.id }.map(ReaderHighlightPayload.init),
             bridge: session.reader,
             onSelection: { action, selection in app.handleReaderSelection(action, selection) },
-            onHighlightClicked: { app.highlightClicked($0) }
+            onHighlightClicked: { app.highlightClicked($0) },
+            onContentCrashed: { [paperID = paper.id] in crashedPaper = paperID }
         )
     }
 }

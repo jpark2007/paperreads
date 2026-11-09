@@ -14,6 +14,8 @@ struct ChatWebView: NSViewRepresentable {
     let references: [String: String]
     var onJumpToBlock: (Int) -> Void
     var onOpenReference: (String) -> Void
+    /// Called when the content process keeps crashing; reloading (and replay) has stopped.
+    var onContentCrashed: () -> Void = {}
 
     func makeCoordinator() -> Coordinator { Coordinator(parent: self) }
 
@@ -50,12 +52,16 @@ struct ChatWebView: NSViewRepresentable {
         /// Intermediate states are dropped: only the newest text crosses to the web view.
         private var pendingStreaming: (text: String, thinking: Bool)?
         private var streamingCallQueued = false
+        private var crashGuard = WebCrashGuard()
+        private var reloadTask: Task<Void, Never>?
 
         init(parent: ChatWebView) {
             self.parent = parent
         }
 
         func tearDown() {
+            reloadTask?.cancel()
+            reloadTask = nil
             chain?.cancel()
             chain = nil
             isReady = false
@@ -169,7 +175,19 @@ struct ChatWebView: NSViewRepresentable {
         func webViewWebContentProcessDidTerminate(_ webView: WKWebView) {
             isReady = false
             resetApplied()
-            WebBridge.load(webView, page: parent.page)
+            reloadTask?.cancel()
+            switch crashGuard.recordCrash(key: "chat") {
+            case .giveUp:
+                reloadTask = nil
+                parent.onContentCrashed()
+            case .reload(let delay):
+                reloadTask = Task { [weak self, weak webView] in
+                    try? await Task.sleep(for: delay)
+                    guard let self, let webView, !Task.isCancelled, !self.isReady else { return }
+                    self.reloadTask = nil
+                    WebBridge.load(webView, page: self.parent.page)
+                }
+            }
         }
 
         // MARK: WKUIDelegate

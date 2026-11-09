@@ -182,3 +182,39 @@ enum WebBridge {
         }
     }
 }
+
+/// Limits reloads after the WebContent process terminates. Content that kills the process
+/// deterministically (memory limit, WebKit bug) would otherwise reload forever, spawning one
+/// process after another. Reloads back off exponentially; after `maxCrashes` terminations
+/// within `window` the caller stops and shows a native fallback instead.
+struct WebCrashGuard {
+    static let maxCrashes = 3
+    static let window: TimeInterval = 60
+
+    enum Decision {
+        case reload(after: Duration)
+        case giveUp
+    }
+
+    private var key: String?
+    private var crashes: [Date] = []
+
+    /// Records a termination for `key` (crash history resets when the key changes).
+    mutating func recordCrash(key: String, now: Date = Date()) -> Decision {
+        if self.key != key {
+            self.key = key
+            crashes = []
+        }
+        crashes = crashes.filter { now.timeIntervalSince($0) < Self.window }
+        crashes.append(now)
+        if crashes.count >= Self.maxCrashes { return .giveUp }
+        // 0.5 s, 1 s, … before each reload.
+        let ms = 500 << (crashes.count - 1)
+        return .reload(after: .milliseconds(ms))
+    }
+
+    mutating func reset() {
+        key = nil
+        crashes = []
+    }
+}

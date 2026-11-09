@@ -68,6 +68,8 @@ private struct AskPanel: View {
 
     @State private var draft = ""
     @State private var inputHeight: CGFloat = 36
+    /// Set when the chat web view's content process kept crashing; falls back to plain text.
+    @State private var chatCrashed = false
 
     init(session: PaperSession, engine: ChatEngine) {
         self.session = session
@@ -105,12 +107,15 @@ private struct AskPanel: View {
         }
         .onChange(of: session.paperID) {
             draft = ""
+            chatCrashed = false
         }
     }
 
     @ViewBuilder
     private var transcript: some View {
-        if let page = WebBridge.pageURL("chat") {
+        if chatCrashed {
+            plainTranscript
+        } else if let page = WebBridge.pageURL("chat") {
             ChatWebView(
                 page: page,
                 paperTitle: session.paper.title,
@@ -119,7 +124,8 @@ private struct AskPanel: View {
                 isThinking: engine.isThinking,
                 references: referenceTitles,
                 onJumpToBlock: { app.reveal(block: $0) },
-                onOpenReference: { openReference($0) }
+                onOpenReference: { openReference($0) },
+                onContentCrashed: { chatCrashed = true }
             )
         } else {
             VStack {
@@ -130,6 +136,35 @@ private struct AskPanel: View {
                 Spacer()
             }
             .frame(maxWidth: .infinity)
+        }
+    }
+
+    /// Degraded transcript (plain text) used after the chat web view kept crashing.
+    private var plainTranscript: some View {
+        ScrollView {
+            VStack(alignment: .leading, spacing: Theme.Space.m) {
+                Text("The formatted chat view stopped working; showing plain text.")
+                    .font(.rounded(12))
+                    .foregroundStyle(Theme.faint)
+                ForEach(engine.messages) { m in
+                    VStack(alignment: .leading, spacing: Theme.Space.xxs) {
+                        Text(m.role == "user" ? "You" : "Claude").capsLabel(Theme.muted)
+                        Text(m.markdown)
+                            .font(.rounded(13))
+                            .foregroundStyle(Theme.ink)
+                            .textSelection(.enabled)
+                            .fixedSize(horizontal: false, vertical: true)
+                    }
+                }
+                if let s = engine.streamingText, !s.isEmpty {
+                    Text(s)
+                        .font(.rounded(13))
+                        .foregroundStyle(Theme.muted)
+                        .fixedSize(horizontal: false, vertical: true)
+                }
+            }
+            .padding(Theme.Space.l)
+            .frame(maxWidth: .infinity, alignment: .leading)
         }
     }
 

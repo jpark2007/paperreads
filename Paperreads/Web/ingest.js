@@ -195,7 +195,20 @@
     container.querySelectorAll('[id]').forEach((el) => el.removeAttribute('id'));
   }
 
-  function finish(title, authors, abstract, container) {
+  /**
+   * Round-trips the built tree through the HTML parser. The tree was assembled with DOM calls,
+   * which allow nestings the parser never produces (e.g. a <div> inside a <p>, from LaTeXML
+   * description items). The reader re-parses content.html, so blocks must be tagged on exactly
+   * the structure the parser yields, or block ids and blocks.json drift from what is shown.
+   */
+  function reparse(container) {
+    const doc = new DOMParser().parseFromString(
+      '<!DOCTYPE html><html><head></head><body>' + container.innerHTML + '</body></html>', 'text/html');
+    return doc.body;
+  }
+
+  function finish(title, authors, abstract, built) {
+    const container = reparse(built);
     const blocks = tagBlocks(container);
     resolveInternalLinks(container);
     return {

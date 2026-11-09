@@ -69,6 +69,8 @@ struct WebReader: NSViewRepresentable {
     let bridge: ReaderBridge
     var onSelection: (SelectionAction, ReaderSelection) -> Void
     var onHighlightClicked: (UUID) -> Void
+    /// Called when the content process keeps crashing on this paper; reloading has stopped.
+    var onContentCrashed: () -> Void = {}
 
     func makeCoordinator() -> Coordinator { Coordinator(parent: self) }
 
@@ -105,6 +107,8 @@ struct WebReader: NSViewRepresentable {
         private var applied: [UUID: ReaderHighlightPayload] = [:]
         private var chain: Task<Void, Never>?
         private var generation = 0
+        private var crashGuard = WebCrashGuard()
+        private var reloadTask: Task<Void, Never>?
 
         init(parent: WebReader) {
             self.parent = parent
@@ -118,6 +122,8 @@ struct WebReader: NSViewRepresentable {
 
         func tearDown() {
             generation += 1
+            reloadTask?.cancel()
+            reloadTask = nil
             chain?.cancel()
             chain = nil
             isReady = false
@@ -249,7 +255,20 @@ struct WebReader: NSViewRepresentable {
             isContentLoaded = false
             loadedKey = nil
             applied = [:]
-            WebBridge.load(webView, page: parent.page)
+            reloadTask?.cancel()
+            switch crashGuard.recordCrash(key: parent.paperID.uuidString) {
+            case .giveUp:
+                reloadTask = nil
+                parent.onContentCrashed()
+            case .reload(let delay):
+                let gen = generation
+                reloadTask = Task { [weak self, weak webView] in
+                    try? await Task.sleep(for: delay)
+                    guard let self, let webView, !Task.isCancelled, self.generation == gen else { return }
+                    self.reloadTask = nil
+                    WebBridge.load(webView, page: self.parent.page)
+                }
+            }
         }
 
         // MARK: WKUIDelegate

@@ -66,8 +66,10 @@ struct ImportSheet: View {
         .frame(width: 540)
         .background(Theme.bg)
         .onAppear {
+            // No clipboard prefill: reading the general pasteboard without a user paste action
+            // pulls whatever was copied (often a password) into the app and can trigger the
+            // system paste-permission alert on every open. Cmd-V in the field still works.
             focused = true
-            prefillFromPasteboard()
         }
         .fileImporter(isPresented: $choosingFile, allowedContentTypes: [.pdf], allowsMultipleSelection: true) { result in
             switch result {
@@ -93,21 +95,6 @@ struct ImportSheet: View {
         } catch {
             self.error = (error as? LocalizedError)?.errorDescription
                 ?? "Couldn't recognise that. Try an arXiv id (2401.12345), an arxiv.org link, or a DOI (10.xxxx/…)."
-        }
-    }
-
-    /// If the clipboard holds something that looks like an arXiv/DOI reference, offer it.
-    private func prefillFromPasteboard() {
-        guard input.isEmpty, let s = NSPasteboard.general.string(forType: .string)?
-            .trimmingCharacters(in: .whitespacesAndNewlines), !s.isEmpty, s.count <= 300 else { return }
-        let patterns = [
-            #"^(https://)?(www\.)?(arxiv\.org|ar5iv\.(labs\.)?arxiv\.org)/(abs|pdf|html)/\S+$"#,
-            #"^\d{4}\.\d{4,5}(v\d+)?$"#,
-            #"^[a-z\-]+(\.[A-Z]{2})?/\d{7}(v\d+)?$"#,
-            #"^(https://(dx\.)?doi\.org/)?10\.\d{4,9}/\S+$"#,
-        ]
-        if patterns.contains(where: { s.range(of: $0, options: [.regularExpression, .caseInsensitive]) != nil }) {
-            input = s
         }
     }
 }
