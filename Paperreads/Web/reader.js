@@ -451,7 +451,7 @@
       }
       // Content was sanitized at ingest; sanitize again (defence in depth: the file is on disk).
       const src = new DOMParser().parseFromString(html, 'text/html');
-      paper.appendChild(P.sanitizeChildren(src.body, document, { allowImages: true }));
+      paper.appendChild(P.sanitizeChildren(src.body, document, { allowImages: true, keepBlockIds: true }));
       paper.querySelectorAll('img').forEach((img) => {
         img.loading = 'lazy';
         img.decoding = 'async';

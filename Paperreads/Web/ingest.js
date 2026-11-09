@@ -125,7 +125,8 @@
 
   /**
    * Assigns data-b=0..n in document order to h2,h3,h4, p, li (no nested p), figcaption,
-   * div.eq, table (not inside div.eq), blockquote (no nested p). An element inside an
+   * div.eq, table (not inside div.eq), blockquote (no nested p), pre and div.listing (code
+   * and algorithm listings). An element inside an
    * already-tagged block is not tagged again (so block texts never overlap). Empty blocks
    * are skipped. Returns [{b, section, text}].
    */
@@ -134,7 +135,7 @@
     let section = '';
     let b = 0;
     const tagged = [];
-    const candidates = container.querySelectorAll('h2, h3, h4, p, li, figcaption, div.eq, table, blockquote');
+    const candidates = container.querySelectorAll('h2, h3, h4, p, li, figcaption, div.eq, table, blockquote, pre, div.listing');
     candidates.forEach((el) => {
       const tag = el.localName;
       if (tag === 'li' && el.querySelector('p')) return;
@@ -155,7 +156,7 @@
     return blocks;
   }
 
-  const BLOCKISH = 'h2, h3, h4, p, li, figcaption, div.eq, table, blockquote';
+  const BLOCKISH = 'h2, h3, h4, p, li, figcaption, div.eq, table, blockquote, pre, div.listing';
 
   /** data-b of the block best representing `target` (itself, first inside, ancestor, next). */
   function blockForTarget(target, container) {
@@ -638,7 +639,9 @@
     if (typeof md !== 'string') throw new Error('markdown must be a string');
     const doc = P.inertDocument();
     const container = doc.createElement('div');
-    container.appendChild(P.markdownToFragment(md, doc, { allowImages: true, isolateDisplay: true }));
+    // Images in model output would be fetched from arbitrary hosts by the reader; the
+    // conversion prompt never asks for them, so keep only their alt text.
+    container.appendChild(P.markdownToFragment(md, doc, { allowImages: false, isolateDisplay: true }));
 
     // Title: the first h1 (removed). Any later h1 is demoted to a section heading.
     let title = '';

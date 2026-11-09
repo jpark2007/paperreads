@@ -118,10 +118,31 @@
     });
   }
 
+  /**
+   * Model-written links are untrusted (the paper text can prompt-inject them): show the full
+   * URL on hover and the destination host inline, so a click never goes somewhere unseen.
+   */
+  function exposeLinks(root) {
+    root.querySelectorAll('a[href]').forEach((a) => {
+      const href = a.getAttribute('href') || '';
+      if (!/^https:/i.test(href)) return;
+      let host = '';
+      try { host = new URL(href).host; } catch (_) { return; }
+      a.title = href;
+      if (host && a.textContent.indexOf(host) < 0) {
+        const s = document.createElement('span');
+        s.className = 'link-host';
+        s.textContent = ' (' + host + ')';
+        a.parentNode.insertBefore(s, a.nextSibling);
+      }
+    });
+  }
+
   function renderMarkdownInto(el, md) {
     const frag = P.markdownToFragment(String(md || ''), document, { allowImages: false });
     el.textContent = '';
     el.appendChild(frag);
+    exposeLinks(el);
     linkCitations(el);
     wrapTables(el);
     P.renderMath(el);

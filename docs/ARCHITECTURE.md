@@ -72,21 +72,27 @@ Pipeline (each step updates `paper.importState` + `importStatusDetail`, saves co
 1. **Resolve** (`fetching`): DOI → Semantic Scholar `GET /graph/v1/paper/DOI:{doi}?fields=title,authors,year,abstract,externalIds,openAccessPdf`.
    If it has an ArXiv external id → arXiv path. Else if openAccessPdf → download PDF → PDF path.
    Else fail with "No open-access PDF found — drag the PDF in instead."
-   Dropped PDF: extract first-2-pages text with PDFKit; regex `arXiv:(\d{4}\.\d{4,5})(v\d+)?` → arXiv path
-   (keep the local PDF); else PDF path.
+   Dropped PDF: extract first-2-pages text with PDFKit. The arXiv margin stamp
+   `arXiv:{id}(vN)? [category]` → arXiv path (keep the local PDF). A bare `arXiv:{id}` mention
+   (may be a cited preprint) is used only if Semantic Scholar's title for that id appears on
+   page 1; else PDF path. A dropped PDF's file-name title is provisional: replaced by S2
+   metadata or by IngestResult.title.
 2. **arXiv path**: metadata from Semantic Scholar `paper/arXiv:{id}` (fallback: HTML title).
    Clean HTML: try `https://arxiv.org/html/{id}` then `https://ar5iv.labs.arxiv.org/html/{id}`;
    valid only if response is 200 and contains `ltx_document` (ar5iv redirects to abs page when
    missing). Run `WebProcessor.ingestArxivHTML(html, baseURL: finalURL)`. Also download
    `https://arxiv.org/pdf/{id}` to `original.pdf` (non-fatal if it fails). If no HTML → PDF path.
    `contentKind = .arxivHTML`.
-3. **PDF path** (`converting`): `ClaudeClient.convertPDF(pdfData:onProgress:)` → markdown;
-   save `source.md`; `WebProcessor.ingestMarkdown(md)`. `contentKind = .claudeMarkdown`.
-   If title unknown, use IngestResult.title.
+3. **PDF path** (`converting`): `ClaudeClient.convertPDF(pdfData:pageCount:onProgress:)` →
+   `PDFConversion`; if `!isComplete` (stopped at max_tokens / context window) append a visible
+   "Conversion incomplete" blockquote and set `importStatusDetail` after ready (fail only if no
+   text at all). Save `source.md`; `WebProcessor.ingestMarkdown(md)`. `contentKind = .claudeMarkdown`.
+   If title unknown (placeholder or file name), use IngestResult.title.
 4. Save content via `PaperStore.writeContent`. State → `ready` (reader usable now).
 5. **References** (`referencesState = fetching`, runs after ready, non-blocking): Semantic
    Scholar `GET /graph/v1/paper/{s2id or arXiv:id or DOI:doi}/references?fields=title,authors,year,abstract,externalIds,openAccessPdf&limit=500`.
-   For non-arXiv papers without ids, first `GET /graph/v1/paper/search/match?query={title}`.
+   For non-arXiv papers without ids, first `GET /graph/v1/paper/search/match?query={title}`;
+   the hit is accepted only if its normalised title matches the paper's title.
    Create `ReferenceEntry` rows (ordinal 1..n). For each with a non-empty abstract, embed
    "title. abstract" with `Embedder` and insert `RefChunk(label: "r\(ordinal)")`. Then `ready`/`unavailable`/`failed`.
 
@@ -94,7 +100,11 @@ Network hygiene (all HTTP): one shared `URLSession` with 30s request timeout (Cl
 `User-Agent: Paperreads/0.1 (personal research reader)`, max response sizes enforced
 (HTML 25MB, PDF 60MB), only `https` URLs, Semantic Scholar 429 → exponential backoff
 (1s,2s,4s, max 3 retries). Imports are serialized (one active pipeline at a time, others queued).
-On app launch, papers stuck in a busy state are marked failed with "Interrupted — Retry".
+On app launch, papers stuck in a busy state are marked failed with "Interrupted — Retry", and
+ready papers whose references are `none`/`failed` are queued for the reference step again
+(`Importer.resumeReferences`). The library context menu offers "Retry References"
+(`Importer.retryReferences`). Hosts that are loopback/private/link-local/CGNAT IP literals,
+`localhost` or `.local` are rejected by `HTTP.validate` (also on every redirect hop).
 
 ### WebProcessor (`Services/WebProcessor.swift`, module C)
 
@@ -156,8 +166,10 @@ struct ClaudeClient {
     /// content_block_start) so the assistant turn can be replayed byte-for-byte.
     func stream(body: [String: Any]) -> AsyncThrowingStream<ClaudeStreamEvent, Error>
     /// PDF → Markdown conversion (document block, base64). effort low, max_tokens 64000.
-    func convertPDF(pdfData: Data, onProgress: @escaping @MainActor (Int) -> Void) async throws -> String
+    func convertPDF(pdfData: Data, pageCount: Int? = nil,
+                    onProgress: @escaping @MainActor (Int) -> Void) async throws -> PDFConversion
 }
+struct PDFConversion { let markdown: String; let stopReason: String?; let isComplete: Bool }
 ```
 SSE: parse `event:`/`data:` lines from `URLSession.bytes`; handle `message_start`,
 `content_block_start`, `content_block_delta` (`text_delta`, `thinking_delta`, `signature_delta`,
@@ -202,19 +214,27 @@ struct ChatDisplayMessage: Codable, Identifiable, Equatable { let id: UUID; let 
   then the new user turn. Persist the user turn BEFORE sending and the assistant turn's exact
   content blocks after `done`. If a request fails, delete only the just-added unanswered user
   turn (it is the tail, so history stays append-only) and set `errorText`.
-- `max_tokens` 16000.
-- Conversation size guard: if the stored conversation exceeds ~150 turns, `newConversation()`.
+- The new user turn's last content block carries `cache_control: {type: "ephemeral"}` in the
+  request copy only (never in stored contentJSON), so each turn reads the whole prior prefix
+  from cache (2 of 4 breakpoints).
+- `max_tokens` 16000. The frozen system is built lazily on the first send.
+- Conversation size guard: if the stored conversation exceeds ~150 turns or the estimated
+  request size (bytes/3) exceeds ~176k tokens, `newConversation()` with a notice.
+- Streaming text is coalesced: `streamingText` is published at most every 50 ms, and
+  ChatWebView keeps only the latest pending `Chat.setStreaming` payload.
 
 ## 5. Web layer (`Paperreads/Web/`, module A)
 
 All pages load only bundled files (no CDN): `vendor/katex/katex.min.{js,css}` + fonts,
 `vendor/marked.min.js`. Shared `common.css` (tokens, typography) and `common.js`
 (math helpers). A strict CSP meta tag on every page:
-`default-src 'none'; script-src 'self'; style-src 'self' 'unsafe-inline'; font-src 'self'; img-src 'self' https: data:;`
-(reader/chat). Paper HTML is UNTRUSTED: ingest must sanitize to an allowlist of tags
+`default-src 'none'; script-src 'self'; style-src 'self' 'unsafe-inline'; font-src 'self'; img-src 'self' https://arxiv.org https://*.arxiv.org data:;`
+(reader; chat uses `img-src 'self' data:`). Claude Markdown keeps image alt text only. Paper HTML is UNTRUSTED: ingest must sanitize to an allowlist of tags
 (`h1-h4 p ul ol li figure figcaption img table thead tbody tr td th em strong i b sub sup a span div br blockquote code pre cite`)
 and attributes (`src` (https or data:image only), `href` (https or `#…` only), `colspan`,
-`rowspan`, `alt`, `data-b`, `data-tex`, `data-d`, `class` only for our own classes). No inline
+`rowspan`, `alt`, `data-tex`, `data-d`, `class` only for our own classes; `data-b` only with
+`keepBlockIds: true`, i.e. the reader's re-sanitize of our own content.html — untrusted input
+can never set block ids). Chat shows each model link's full URL on hover and its host inline. No inline
 event handlers, no `style`, no `script`/`iframe`/`object`/`form`/`svg`/`math` survives ingest.
 LLM output rendered in chat is ALSO untrusted: marked output must be sanitized with the same
 allowlist before insertion.
@@ -239,7 +259,8 @@ left to fallback.
   placeholders before `marked.parse`, restore as math spans after. Title = first `# ` heading
   (removed from body); abstract = paragraph(s) under a heading matching /abstract/i. Sanitize. Tag.
 - **Block tagging**: in document order, assign `data-b=0..n` to: `h2,h3,h4`, `p`, `li` (without
-  nested `p`), `figcaption`, `div.eq`, `table` (not inside div.eq), `blockquote` (without nested `p`).
+  nested `p`), `figcaption`, `div.eq`, `table` (not inside div.eq), `blockquote` (without nested `p`),
+  `pre`, `div.listing` (code / algorithm listings).
   Block text = textContent with math spans replaced by `$tex$` / `$$tex$$`, whitespace collapsed.
   `section` = text of the most recent h2/h3. Skip empty blocks.
 

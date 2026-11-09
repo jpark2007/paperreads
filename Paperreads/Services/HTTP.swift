@@ -101,8 +101,82 @@ enum HTTP {
     static func validate(_ url: URL) throws {
         guard url.scheme?.lowercased() == "https",
               let host = url.host, !host.isEmpty,
-              url.user == nil, url.password == nil
+              url.user == nil, url.password == nil,
+              isPublicHost(host)
         else { throw HTTPError.insecureURL(url.absoluteString) }
+    }
+
+    /// Rejects hosts that point into the user's machine or local network: `localhost`,
+    /// mDNS `.local`, single-label names, and IP literals in loopback, private, link-local,
+    /// CGNAT, multicast or reserved ranges. URLs from untrusted metadata (Semantic Scholar's
+    /// openAccessPdf, redirect hops) must not reach internal services.
+    static func isPublicHost(_ rawHost: String) -> Bool {
+        var host = rawHost.lowercased()
+        if host.hasPrefix("["), host.hasSuffix("]") { host = String(host.dropFirst().dropLast()) }
+        while host.hasSuffix(".") { host.removeLast() }
+        guard !host.isEmpty else { return false }
+
+        if host.contains(":") { return isPublicIPv6(host) }
+        if let v4 = parseIPv4(host) { return isPublicIPv4(v4) }
+        // All-numeric / hex hostnames are odd IPv4 spellings (e.g. 2130706433, 0x7f.1); refuse.
+        // No real TLD is numeric, so a numeric/hex last label is always an IP spelling.
+        if let last = host.split(separator: ".").last,
+           last.allSatisfy({ $0.isASCII && $0.isNumber }) || last.hasPrefix("0x") {
+            return false
+        }
+        if host == "localhost" || host.hasSuffix(".localhost") { return false }
+        if host.hasSuffix(".local") || host.hasSuffix(".internal") || host.hasSuffix(".lan")
+            || host.hasSuffix(".home.arpa") { return false }
+        if !host.contains(".") { return false }       // single-label (intranet) names
+        return true
+    }
+
+    private static func parseIPv4(_ s: String) -> [UInt8]? {
+        let parts = s.split(separator: ".", omittingEmptySubsequences: false)
+        guard parts.count == 4 else { return nil }
+        var out: [UInt8] = []
+        for p in parts {
+            guard !p.isEmpty, p.count <= 3, p.allSatisfy({ $0.isASCII && $0.isNumber }),
+                  let n = UInt8(p) else { return nil }
+            out.append(n)
+        }
+        return out
+    }
+
+    private static func isPublicIPv4(_ a: [UInt8]) -> Bool {
+        switch (a[0], a[1]) {
+        case (0, _), (10, _), (127, _): return false
+        case (100, 64...127): return false             // CGNAT
+        case (169, 254): return false                  // link-local
+        case (172, 16...31): return false
+        case (192, 168): return false
+        case (192, 0) where a[2] == 0 || a[2] == 2: return false
+        case (198, 18...19): return false              // benchmarking
+        case (198, 51) where a[2] == 100: return false
+        case (203, 0) where a[2] == 113: return false
+        default: break
+        }
+        return a[0] < 224                              // multicast / reserved
+    }
+
+    private static func isPublicIPv6(_ s: String) -> Bool {
+        var addr = in6_addr()
+        let ok = s.withCString { inet_pton(AF_INET6, $0, &addr) } == 1
+        guard ok else { return false }
+        let b = withUnsafeBytes(of: &addr) { Array($0) }
+        if b.allSatisfy({ $0 == 0 }) { return false }                         // ::
+        if b[0..<15].allSatisfy({ $0 == 0 }) && b[15] == 1 { return false }   // ::1
+        if b[0] == 0xfe && (b[1] & 0xc0) == 0x80 { return false }             // fe80::/10
+        if (b[0] & 0xfe) == 0xfc { return false }                             // fc00::/7
+        if b[0] == 0xff { return false }                                      // multicast
+        // IPv4-mapped / compatible (::ffff:a.b.c.d, ::a.b.c.d) and NAT64 well-known prefix.
+        if b[0..<10].allSatisfy({ $0 == 0 }) && ((b[10] == 0xff && b[11] == 0xff) || (b[10] == 0 && b[11] == 0)) {
+            return isPublicIPv4(Array(b[12..<16]))
+        }
+        if b[0] == 0x00 && b[1] == 0x64 && b[2] == 0xff && b[3] == 0x9b {
+            return isPublicIPv4(Array(b[12..<16]))
+        }
+        return true
     }
 
     static func isAllowed(_ url: URL?) -> Bool {

@@ -46,6 +46,10 @@ struct ChatWebView: NSViewRepresentable {
         private var appliedMessages: [ChatDisplayMessage]?
         private var appliedStreaming: (text: String?, thinking: Bool)?
         private var chain: Task<Void, Never>?
+        /// Latest in-progress streaming state waiting for an already-queued call to send it.
+        /// Intermediate states are dropped: only the newest text crosses to the web view.
+        private var pendingStreaming: (text: String, thinking: Bool)?
+        private var streamingCallQueued = false
 
         init(parent: ChatWebView) {
             self.parent = parent
@@ -55,6 +59,8 @@ struct ChatWebView: NSViewRepresentable {
             chain?.cancel()
             chain = nil
             isReady = false
+            pendingStreaming = nil
+            streamingCallQueued = false
         }
 
         private func resetApplied() {
@@ -62,6 +68,8 @@ struct ChatWebView: NSViewRepresentable {
             appliedReferences = nil
             appliedMessages = nil
             appliedStreaming = nil
+            pendingStreaming = nil
+            streamingCallQueued = false
         }
 
         /// Pushes only what changed. Order matters: messages land before the streaming state is
@@ -89,9 +97,28 @@ struct ChatWebView: NSViewRepresentable {
             }
             if appliedStreaming?.text != p.streamingText || appliedStreaming?.thinking != p.isThinking {
                 appliedStreaming = (p.streamingText, p.isThinking)
-                let text: Any = p.streamingText ?? NSNull()
-                let thinking = p.isThinking
-                enqueue { _ = await WebBridge.call($0, "Chat.setStreaming(s, t);", ["s": text, "t": thinking]) }
+                if let text = p.streamingText {
+                    // Coalesce: if a streaming call is already queued it will pick this up.
+                    pendingStreaming = (text, p.isThinking)
+                    if !streamingCallQueued {
+                        streamingCallQueued = true
+                        enqueue { [weak self] webView in
+                            guard let self else { return }
+                            self.streamingCallQueued = false
+                            guard let s = self.pendingStreaming else { return }
+                            self.pendingStreaming = nil
+                            _ = await WebBridge.call(webView, "Chat.setStreaming(s, t);",
+                                                     ["s": s.text, "t": s.thinking])
+                        }
+                    }
+                } else {
+                    // Clearing is queued in order (after any messages update) and never coalesced;
+                    // a still-queued partial update becomes a no-op.
+                    pendingStreaming = nil
+                    streamingCallQueued = false
+                    let thinking = p.isThinking
+                    enqueue { _ = await WebBridge.call($0, "Chat.setStreaming(s, t);", ["s": NSNull(), "t": thinking]) }
+                }
             }
         }
 

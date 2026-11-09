@@ -126,6 +126,7 @@ final class AppCommands: ObservableObject {
         guard !didLaunch else { return }
         didLaunch = true
         Importer.recoverInterrupted(context: context)
+        Importer.shared.resumeReferences(context: context)
     }
 
     /// Opens a session for `selectedPaperID`, cancelling the previous paper's chat.

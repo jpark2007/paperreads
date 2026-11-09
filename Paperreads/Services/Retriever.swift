@@ -38,7 +38,7 @@ enum Embedder {
 
     /// Embeds many texts off the main actor. Output is index-aligned with `texts`.
     static func embedBatch(_ texts: [String]) async -> [Data] {
-        await Task.detached(priority: .utility) {
+        let work = Task.detached(priority: .utility) {
             var out: [Data] = []
             out.reserveCapacity(texts.count)
             for t in texts {
@@ -46,7 +46,13 @@ enum Embedder {
                 out.append(embed(t))
             }
             return out
-        }.value
+        }
+        // Awaiting a detached task's value does not forward cancellation; do it explicitly.
+        return await withTaskCancellationHandler {
+            await work.value
+        } onCancel: {
+            work.cancel()
+        }
     }
 
     // MARK: Packing

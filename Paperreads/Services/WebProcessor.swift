@@ -90,7 +90,18 @@ final class WebProcessor: NSObject {
             if message?.contains("Ingest unavailable") == true { throw WebProcessorError.ingestUnavailable }
             throw WebProcessorError.scriptFailed(message ?? error.localizedDescription)
         }
+        if let s = raw as? String {
+            // Copying + JSON-decoding a multi-MB result stays off the main actor.
+            return try await Task.detached(priority: .userInitiated) {
+                try WebProcessor.decodeJSON(Data(s.utf8))
+            }.value
+        }
         return try decode(raw)
+    }
+
+    nonisolated private static func decodeJSON(_ data: Data) throws -> IngestResult {
+        do { return try JSONDecoder().decode(IngestResult.self, from: data) }
+        catch { throw WebProcessorError.badResult }
     }
 
     private func decode(_ raw: Any?) throws -> IngestResult {

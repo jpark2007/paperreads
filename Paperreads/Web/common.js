@@ -97,7 +97,9 @@
           }
           break;
         case 'alt': if (tag === 'img') out = value.slice(0, 1000); break;
-        case 'data-b': if (/^\d{1,7}$/.test(value)) out = value; break;
+        // Block ids are assigned by the app (tagBlocks). Untrusted input must never set them;
+        // only the reader's re-sanitize of our own content.html keeps them.
+        case 'data-b': if (opts && opts.keepBlockIds && /^\d{1,7}$/.test(value)) out = value; break;
         case 'data-tex': if (value.length <= 20000) out = value; break;
         case 'data-d': if (value === '0' || value === '1') out = value; break;
         case 'class': out = filterClasses(value) || null; break;
@@ -114,10 +116,10 @@
    * allowlist. Returns a DocumentFragment. Nothing from the source tree is moved or adopted,
    * so no attribute or node type can slip through.
    *
-   * opts: { allowImages=true, keepIds=false, baseURL }
+   * opts: { allowImages=true, keepIds=false, keepBlockIds=false, baseURL }
    */
   function sanitizeChildren(srcParent, doc, opts) {
-    const o = Object.assign({ allowImages: true, keepIds: false, baseURL: null }, opts || {});
+    const o = Object.assign({ allowImages: true, keepIds: false, keepBlockIds: false, baseURL: null }, opts || {});
     const frag = doc.createDocumentFragment();
     walkSanitize(srcParent, frag, doc, o, 0);
     return frag;

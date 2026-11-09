@@ -396,7 +396,11 @@ struct ClaudeClient {
     }
 
     /// PDF → Markdown conversion (document block, base64). effort low, max_tokens 64000.
-    func convertPDF(pdfData: Data, onProgress: @escaping @MainActor (Int) -> Void) async throws -> String {
+    /// `isComplete` is false when the model stopped early (max_tokens or context window), so
+    /// the caller never presents a cut-off conversion as the whole paper. Pass `pageCount`
+    /// when the caller already parsed the PDF, to skip a second PDFKit parse.
+    func convertPDF(pdfData: Data, pageCount: Int? = nil,
+                    onProgress: @escaping @MainActor (Int) -> Void) async throws -> PDFConversion {
         guard !pdfData.isEmpty else {
             throw ClaudeError(type: "invalid_pdf", message: "The PDF is empty.")
         }
@@ -405,12 +409,18 @@ struct ClaudeClient {
             throw ClaudeError(type: "pdf_too_large",
                               message: String(format: "This PDF is %.1f MB; Claude accepts PDFs up to 32 MB.", mb))
         }
-        guard pdfData.starts(with: Array("%PDF".utf8)) || PDFDocument(data: pdfData) != nil else {
-            throw ClaudeError(type: "invalid_pdf", message: "The file isn't a readable PDF.")
+        let pages: Int
+        if let pageCount {
+            pages = pageCount
+        } else {
+            guard let doc = PDFDocument(data: pdfData) else {
+                throw ClaudeError(type: "invalid_pdf", message: "The file isn't a readable PDF.")
+            }
+            pages = doc.pageCount
         }
-        if let doc = PDFDocument(data: pdfData), doc.pageCount > Self.maxPDFPages {
+        if pages > Self.maxPDFPages {
             throw ClaudeError(type: "pdf_too_long",
-                              message: "This PDF has \(doc.pageCount) pages; Claude accepts up to \(Self.maxPDFPages).")
+                              message: "This PDF has \(pages) pages; Claude accepts up to \(Self.maxPDFPages).")
         }
 
         let body: [String: Any] = [
@@ -452,12 +462,13 @@ struct ClaudeClient {
             case .done(_, let text, let stopReason):
                 if stopReason == "refusal" { throw ClaudeError.refusal }
                 await onProgress(text.count)
+                let complete = stopReason == nil || stopReason == "end_turn" || stopReason == "stop_sequence"
                 let markdown = Self.unwrapMarkdown(text)
-                guard !markdown.isEmpty else {
+                guard !markdown.isEmpty || !complete else {
                     throw ClaudeError(type: "empty_conversion",
                                       message: "Claude returned no text for this PDF.")
                 }
-                return markdown
+                return PDFConversion(markdown: markdown, stopReason: stopReason, isComplete: complete)
             }
         }
         throw ClaudeError(type: "stream_incomplete",
@@ -643,8 +654,20 @@ struct ClaudeClient {
                 lines.removeFirst()
                 lines.removeLast()
                 s = lines.joined(separator: "\n").trimmingCharacters(in: .whitespacesAndNewlines)
+            } else if lines.count >= 2, !lines.dropFirst().contains(where: { $0.hasPrefix("```") }) {
+                // Opening fence of a whole-document block that was cut off before closing.
+                lines.removeFirst()
+                s = lines.joined(separator: "\n").trimmingCharacters(in: .whitespacesAndNewlines)
             }
         }
         return s
     }
+}
+
+/// Result of `ClaudeClient.convertPDF`.
+struct PDFConversion: Sendable {
+    let markdown: String
+    let stopReason: String?
+    /// False when Claude stopped before the end (e.g. `max_tokens`, `model_context_window_exceeded`).
+    let isComplete: Bool
 }

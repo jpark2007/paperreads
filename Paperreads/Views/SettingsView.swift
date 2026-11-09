@@ -16,9 +16,8 @@ struct SettingsView: View {
         return !env.isEmpty
     }
 
-    private var embeddingsAvailable: Bool {
-        NLEmbedding.sentenceEmbedding(for: .english) != nil
-    }
+    /// Loaded once (the model is cached by Embedder), not on every body evaluation.
+    @State private var embeddingsAvailable = Embedder.isAvailable
 
     private var isDirty: Bool {
         keyDraft.trimmingCharacters(in: .whitespacesAndNewlines) != settings.apiKey || modelDraft != settings.model

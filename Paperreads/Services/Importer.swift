@@ -22,6 +22,7 @@ enum ImportError: LocalizedError {
     case pdfTooLong(Int)
     case emptyConversion
     case paperRemoved
+    case conversionTooLong
 
     var errorDescription: String? {
         switch self {
@@ -45,6 +46,8 @@ enum ImportError: LocalizedError {
             return "The PDF conversion produced no text."
         case .paperRemoved:
             return "The paper was removed."
+        case .conversionTooLong:
+            return "The paper is too long to convert in one pass, and Claude stopped before reaching any text."
         }
     }
 }
@@ -97,10 +100,21 @@ enum ArxivID {
         return nil
     }
 
-    /// Finds an "arXiv:XXXX.XXXXX(vN)" stamp in extracted PDF text.
+    /// The arXiv margin stamp: "arXiv:2401.12345v2 [cs.CL] 3 Jan 2024". The category token
+    /// distinguishes the paper's own id from preprints it merely cites.
+    static func findStamp(_ text: String) -> String? {
+        find(text, patterns: [#"arXiv:(\d{4}\.\d{4,5})(v\d+)?\s*\[[A-Za-z][A-Za-z.\-]{0,30}\]"#,
+                              #"arXiv:([a-z]+(?:-[a-z]+)?(?:\.[A-Z]{2})?/\d{7})(v\d+)?\s*\[[A-Za-z][A-Za-z.\-]{0,30}\]"#])
+    }
+
+    /// The first "arXiv:XXXX.XXXXX(vN)" anywhere in the text. May be a cited preprint, so the
+    /// caller must confirm it (see Importer.detectArxivID / pipeline).
     static func findInText(_ text: String) -> String? {
-        let patterns = [#"arXiv:(\d{4}\.\d{4,5})(v\d+)?"#,
-                        #"arXiv:([a-z]+(?:-[a-z]+)?(?:\.[A-Z]{2})?/\d{7})(v\d+)?"#]
+        find(text, patterns: [#"arXiv:(\d{4}\.\d{4,5})(v\d+)?"#,
+                              #"arXiv:([a-z]+(?:-[a-z]+)?(?:\.[A-Z]{2})?/\d{7})(v\d+)?"#])
+    }
+
+    private static func find(_ text: String, patterns: [String]) -> String? {
         for p in patterns {
             guard let re = try? NSRegularExpression(pattern: p, options: [.caseInsensitive]) else { continue }
             let r = NSRange(text.startIndex..., in: text)
@@ -214,9 +228,12 @@ final class Importer: ObservableObject {
     private var current: (id: UUID, task: Task<Void, Never>)?
     private var refQueue: [Job] = []
     private var refCurrent: (id: UUID, task: Task<Void, Never>)?
+    /// Papers whose title is only the dropped file's name; replaced by real metadata or by
+    /// the title found in the converted text.
+    private var provisionalTitles: Set<UUID> = []
 
     private static let placeholderPrefix = "Importing "
-    private static let maxLocalPDFBytes = HTTP.maxPDFBytes
+    nonisolated private static let maxLocalPDFBytes = HTTP.maxPDFBytes
     private static let maxConvertPDFBytes = 32 * 1024 * 1024
     private static let maxConvertPages = 600
 
@@ -256,23 +273,41 @@ final class Importer: ObservableObject {
         return paper
     }
 
-    /// Copies the PDF into the store, creates Paper, runs pipeline.
+    /// Copies the PDF into the store, creates Paper, runs pipeline. The copy (up to 60 MB,
+    /// possibly from a slow volume) runs off the main actor; the Paper is returned at once.
     func importPDF(at url: URL, context: ModelContext) -> Paper {
         let name = url.deletingPathExtension().lastPathComponent
         let paper = Paper(title: name.isEmpty ? "Untitled PDF" : name, sourceURL: nil)
         paper.importState = .queued
-        paper.importStatusDetail = "Waiting…"
+        paper.importStatusDetail = "Copying PDF…"
         context.insert(paper)
+        save(context)
+        let id = paper.id
+        provisionalTitles.insert(id)
+        activeIds.insert(id)
 
-        do {
-            try copyPDF(from: url, to: PaperStore.pdfURL(paper.id))
-            paper.hasPDF = true
-            save(context)
-            enqueue(Job(id: paper.id, context: context))
-        } catch {
-            paper.importState = .failed
-            paper.importStatusDetail = error.localizedDescription
-            save(context)
+        let dst = PaperStore.pdfURL(id)
+        Task { @MainActor [weak self] in
+            let result: Result<Void, Error> = await Task.detached(priority: .userInitiated) {
+                Result { try Importer.copyPDF(from: url, to: dst) }
+            }.value
+            guard let self else { return }
+            self.activeIds.remove(id)
+            guard let p = self.paper(id, context) else {
+                self.cleanupOrphanDirectory(id, context)
+                return
+            }
+            switch result {
+            case .success:
+                p.hasPDF = true
+                p.importStatusDetail = "Waiting…"
+                self.save(context)
+                self.enqueue(Job(id: id, context: context))
+            case .failure(let error):
+                p.importState = .failed
+                p.importStatusDetail = error.localizedDescription
+                self.save(context)
+            }
         }
         return paper
     }
@@ -307,6 +342,31 @@ final class Importer: ObservableObject {
         if current?.id == paperId { current?.task.cancel() }
         if refCurrent?.id == paperId { refCurrent?.task.cancel() }
         activeIds.remove(paperId)
+    }
+
+    /// Whether the reference list of a ready paper can be fetched again from the UI.
+    func canRetryReferences(_ paper: Paper) -> Bool {
+        paper.importState == .ready && !activeIds.contains(paper.id)
+            && [.failed, .none, .unavailable].contains(paper.referencesState)
+            && refCurrent?.id != paper.id && !refQueue.contains(where: { $0.id == paper.id })
+    }
+
+    /// Re-runs only the reference step for a ready paper.
+    func retryReferences(_ paper: Paper, context: ModelContext) {
+        guard canRetryReferences(paper) else { return }
+        enqueueReferences(Job(id: paper.id, context: context))
+    }
+
+    /// On launch (after `recoverInterrupted`): the reference queue lives in memory, so papers
+    /// whose reference step never ran or was interrupted are queued again.
+    func resumeReferences(context: ModelContext) {
+        let ready = ImportState.ready.rawValue
+        let d = FetchDescriptor<Paper>(predicate: #Predicate { $0.importStateRaw == ready },
+                                       sortBy: [SortDescriptor(\.addedAt)])
+        guard let papers = try? context.fetch(d) else { return }
+        for p in papers where p.referencesState == .none || p.referencesState == .failed {
+            enqueueReferences(Job(id: p.id, context: context))
+        }
     }
 
     /// On launch: papers left in a busy state by a previous run are marked failed.
@@ -413,19 +473,34 @@ final class Importer: ObservableObject {
                 guard let pdfURL = meta?.openAccessPDFURL else { throw ImportError.noOpenAccessPDF }
                 try update(id, ctx, .fetching, "Downloading PDF…")
                 let data = try await downloadPDF(pdfURL)
-                try writePDF(data, id, ctx)
+                try await writePDF(data, id, ctx)
             }
         } else if arxivId == nil, p.hasPDF {
             try update(id, ctx, .fetching, "Reading PDF…")
             let localPDF = PaperStore.pdfURL(id)
-            let found = await Task.detached(priority: .userInitiated) {
+            let detected = await Task.detached(priority: .userInitiated) {
                 Importer.detectArxivID(in: localPDF)
             }.value
+            var found: String?
+            if let stamp = detected.stamp {
+                found = stamp
+            } else if let candidate = detected.candidate {
+                // An "arXiv:" mention without the margin stamp may be a cited preprint: only
+                // take it when that preprint's title appears on the PDF's first page.
+                try update(id, ctx, .fetching, "Checking arXiv id…")
+                if let m = try? await ScholarAPI.paper(ScholarAPI.arxivID(candidate)),
+                   let t = m.cleanTitle, Self.text(detected.firstPage, containsTitle: t) {
+                    found = candidate
+                    meta = m
+                }
+                try Task.checkCancellation()
+            }
             p = try require(id, ctx)
             if let found {
                 arxivId = found
                 p.arxivId = found
                 p.sourceURL = "https://arxiv.org/abs/\(found)"
+                if let m = meta { apply(m, to: p) }
                 save(ctx)
             }
         }
@@ -451,13 +526,13 @@ final class Importer: ObservableObject {
         if let (html, finalURL) = try await fetchArxivHTML(arxivId) {
             try update(id, ctx, .converting, "Preparing clean text…")
             let result = try await WebProcessor.shared.ingestArxivHTML(html, baseURL: finalURL)
-            try finish(id, ctx, result, kind: .arxivHTML)
+            try await finish(id, ctx, result, kind: .arxivHTML)
 
             // Keep a copy of the PDF for the PDF view (non-fatal).
             if let p = paper(id, ctx), !p.hasPDF {
                 if let url = URL(string: "https://arxiv.org/pdf/\(arxivId)"),
                    let data = try? await downloadPDF(url) {
-                    try? writePDF(data, id, ctx)
+                    try? await writePDF(data, id, ctx)
                 }
                 try Task.checkCancellation()
             }
@@ -469,7 +544,7 @@ final class Importer: ObservableObject {
             try update(id, ctx, .fetching, "Downloading PDF…")
             guard let url = URL(string: "https://arxiv.org/pdf/\(arxivId)") else { throw ImportError.missingPDF }
             let data = try await downloadPDF(url)
-            try writePDF(data, id, ctx)
+            try await writePDF(data, id, ctx)
         }
         try await pdfPath(id, ctx)
     }
@@ -487,8 +562,12 @@ final class Importer: ObservableObject {
                 guard response.statusCode == 200 else { continue }
                 let finalURL = response.url ?? url
                 guard HTTP.isAllowed(finalURL) else { continue }
-                let html = String(data: data, encoding: .utf8) ?? String(decoding: data, as: UTF8.self)
-                guard html.contains("ltx_document") else { continue }
+                // Decoding and scanning up to 25 MB stays off the main actor.
+                let html: String? = await Task.detached(priority: .userInitiated) {
+                    let s = String(data: data, encoding: .utf8) ?? String(decoding: data, as: UTF8.self)
+                    return s.contains("ltx_document") ? s : nil
+                }.value
+                guard let html else { continue }
                 return (html, finalURL)
             } catch is CancellationError {
                 throw CancellationError()
@@ -509,7 +588,7 @@ final class Importer: ObservableObject {
         let pdfFile = PaperStore.pdfURL(id)
         let maxBytes = Self.maxConvertPDFBytes
         let maxPages = Self.maxConvertPages
-        let data: Data = try await Task.detached(priority: .userInitiated) {
+        let (data, pageCount): (Data, Int) = try await Task.detached(priority: .userInitiated) {
             let attrs = try? FileManager.default.attributesOfItem(atPath: pdfFile.path)
             let size = (attrs?[.size] as? NSNumber)?.intValue ?? 0
             guard size > 0 else { throw ImportError.missingPDF }
@@ -518,36 +597,61 @@ final class Importer: ObservableObject {
             guard Importer.looksLikePDF(d) else { throw ImportError.notAPDF }
             guard let doc = PDFDocument(data: d) else { throw ImportError.unreadableFile }
             if doc.pageCount > maxPages { throw ImportError.pdfTooLong(doc.pageCount) }
-            return d
+            return (d, doc.pageCount)
         }.value
 
         try update(id, ctx, .converting, "Converting PDF with Claude…")
         let throttle = SaveThrottle()
-        let markdown = try await ClaudeClient().convertPDF(pdfData: data) { [weak self] progress in
+        let conversion = try await ClaudeClient().convertPDF(pdfData: data, pageCount: pageCount) { [weak self] progress in
             guard let self, let p = self.paper(id, ctx), p.importState == .converting else { return }
             p.importStatusDetail = "Converting PDF with Claude… \(progress.formatted()) characters"
             if throttle.shouldSave() { self.save(ctx) }
         }
         try Task.checkCancellation()
-        let md = markdown.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !md.isEmpty else { throw ImportError.emptyConversion }
+        var md = conversion.markdown.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !md.isEmpty else {
+            throw conversion.isComplete ? ImportError.emptyConversion : ImportError.conversionTooLong
+        }
+        if !conversion.isComplete {
+            // Keep what was paid for, but never present it as the whole paper: the marker is a
+            // visible block in the reader and part of the chat's paper text.
+            md += "\n\n> **Conversion incomplete.** Claude stopped before the end of the PDF " +
+                  "(the paper is too long to convert in one pass). Everything after this point " +
+                  "— later sections, appendices and references — is missing from this text; " +
+                  "use the PDF view for it.\n"
+        }
 
         _ = try require(id, ctx)
-        try Data(md.utf8).write(to: PaperStore.markdownURL(id), options: .atomic)
+        let mdURL = PaperStore.markdownURL(id)
+        let mdCopy = md
+        try await Task.detached(priority: .userInitiated) {
+            try Data(mdCopy.utf8).write(to: mdURL, options: .atomic)
+        }.value
 
         try update(id, ctx, .converting, "Preparing clean text…")
         let result = try await WebProcessor.shared.ingestMarkdown(md)
-        try finish(id, ctx, result, kind: .claudeMarkdown)
+        try await finish(id, ctx, result, kind: .claudeMarkdown)
+        if !conversion.isComplete, let p = paper(id, ctx) {
+            p.importStatusDetail = "Text incomplete — the PDF was too long to convert in one pass."
+            save(ctx)
+        }
     }
 
     // 4. Save content → ready.
-    private func finish(_ id: UUID, _ ctx: ModelContext, _ result: IngestResult, kind: ContentKind) throws {
+    private func finish(_ id: UUID, _ ctx: ModelContext, _ result: IngestResult, kind: ContentKind) async throws {
         try Task.checkCancellation()
         try update(id, ctx, .indexing, "Saving…")
+        // Writing content.html / encoding blocks.json can be many MB: keep it off main.
+        try await Task.detached(priority: .userInitiated) {
+            try PaperStore.writeContent(result, for: id)
+        }.value
         let p = try require(id, ctx)
 
-        if isPlaceholderTitle(p), !result.title.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+        let titleIsProvisional = isPlaceholderTitle(p) || provisionalTitles.contains(id)
+            || (p.arxivId == nil && p.doi == nil && p.s2PaperId == nil && p.contentKind == .none)
+        if titleIsProvisional, !result.title.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
             p.title = Self.clean(result.title, max: 500)
+            provisionalTitles.remove(id)
         }
         if p.authors.isEmpty, !result.authors.isEmpty {
             p.authors = result.authors.map { Self.clean($0, max: 200) }.filter { !$0.isEmpty }.prefix(200).map { $0 }
@@ -555,7 +659,6 @@ final class Importer: ObservableObject {
         if p.abstractText.isEmpty, !result.abstract.isEmpty {
             p.abstractText = Self.clean(result.abstract, max: 20_000)
         }
-        try PaperStore.writeContent(result, for: id)
         p.contentKind = kind
         p.importState = .ready
         p.importStatusDetail = nil
@@ -590,7 +693,11 @@ final class Importer: ObservableObject {
         if let s2 = p.s2PaperId, !s2.isEmpty { identifier = s2 }
         else if let ax = p.arxivId { identifier = ScholarAPI.arxivID(ax) }
         else if let doi = p.doi { identifier = ScholarAPI.doiID(doi) }
-        else if !isPlaceholderTitle(p), let m = try await ScholarAPI.match(title: p.title), let pid = m.paperId {
+        else if !isPlaceholderTitle(p), !provisionalTitles.contains(id),
+                let m = try await ScholarAPI.match(title: p.title), let pid = m.paperId,
+                let matched = m.title, Self.titlesMatch(p.title, matched) {
+            // Only accept the search hit when its title really is this paper's title;
+            // otherwise an unrelated paper's references would be injected into chat.
             p = try require(id, ctx)
             p.s2PaperId = pid
             save(ctx)
@@ -692,7 +799,10 @@ final class Importer: ObservableObject {
     }
 
     private func apply(_ m: S2Paper, to p: Paper) {
-        if let t = m.cleanTitle { p.title = Self.clean(t, max: 500) }
+        if let t = m.cleanTitle {
+            p.title = Self.clean(t, max: 500)
+            provisionalTitles.remove(p.id)
+        }
         let names = m.authorNames
         if !names.isEmpty { p.authors = Array(names.prefix(200)).map { Self.clean($0, max: 200) } }
         if let y = m.year, (1600...2200).contains(y) { p.year = y }
@@ -759,14 +869,18 @@ final class Importer: ObservableObject {
         return data
     }
 
-    private func writePDF(_ data: Data, _ id: UUID, _ ctx: ModelContext) throws {
+    private func writePDF(_ data: Data, _ id: UUID, _ ctx: ModelContext) async throws {
+        _ = try require(id, ctx)
+        let dst = PaperStore.pdfURL(id)
+        try await Task.detached(priority: .utility) {
+            try data.write(to: dst, options: .atomic)
+        }.value
         let p = try require(id, ctx)
-        try data.write(to: PaperStore.pdfURL(id), options: .atomic)
         p.hasPDF = true
         save(ctx)
     }
 
-    private func copyPDF(from src: URL, to dst: URL) throws {
+    nonisolated private static func copyPDF(from src: URL, to dst: URL) throws {
         guard src.isFileURL else { throw ImportError.unreadableFile }
         let scoped = src.startAccessingSecurityScopedResource()
         defer { if scoped { src.stopAccessingSecurityScopedResource() } }
@@ -793,13 +907,50 @@ final class Importer: ObservableObject {
         return head.range(of: Data("%PDF-".utf8)) != nil
     }
 
-    /// Text of the first two pages → arXiv stamp.
-    nonisolated static func detectArxivID(in url: URL) -> String? {
-        guard let doc = PDFDocument(url: url) else { return nil }
+    struct DetectedArxiv: Sendable {
+        /// Id from the arXiv margin stamp (trusted).
+        var stamp: String?
+        /// First "arXiv:" id mentioned anywhere (unconfirmed; may be a cited preprint).
+        var candidate: String?
+        var firstPage: String
+    }
+
+    /// Text of the first two pages → arXiv stamp, or an unconfirmed candidate.
+    nonisolated static func detectArxivID(in url: URL) -> DetectedArxiv {
+        guard let doc = PDFDocument(url: url) else { return DetectedArxiv(firstPage: "") }
         var text = ""
+        var first = ""
         for i in 0..<min(2, doc.pageCount) {
-            if let s = doc.page(at: i)?.string { text += s + "\n" }
+            if let s = doc.page(at: i)?.string {
+                text += s + "\n"
+                if i == 0 { first = s }
+            }
         }
-        return ArxivID.findInText(text)
+        let stamp = ArxivID.findStamp(text)
+        return DetectedArxiv(stamp: stamp, candidate: stamp == nil ? ArxivID.findInText(text) : nil,
+                             firstPage: first)
+    }
+
+    /// Lowercased alphanumeric words.
+    nonisolated static func titleWords(_ s: String) -> [String] {
+        s.lowercased().split(whereSeparator: { !($0.isLetter || $0.isNumber) }).map(String.init)
+    }
+
+    /// Whether `title` (≥ 3 words) appears, word for word, in `text` (e.g. a PDF's first page).
+    nonisolated static func text(_ text: String, containsTitle title: String) -> Bool {
+        let t = titleWords(title)
+        guard t.count >= 3 else { return false }
+        let hay = " " + titleWords(text).joined(separator: " ") + " "
+        return hay.contains(" " + t.joined(separator: " ") + " ")
+    }
+
+    /// Normalised title equality, tolerating small differences (punctuation, a word or two).
+    nonisolated static func titlesMatch(_ a: String, _ b: String) -> Bool {
+        let wa = titleWords(a), wb = titleWords(b)
+        guard !wa.isEmpty, !wb.isEmpty else { return false }
+        if wa == wb { return true }
+        let sa = Set(wa), sb = Set(wb)
+        let jaccard = Double(sa.intersection(sb).count) / Double(sa.union(sb).count)
+        return min(wa.count, wb.count) >= 3 && jaccard >= 0.85
     }
 }

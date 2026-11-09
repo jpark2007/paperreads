@@ -113,3 +113,6 @@ a.cite:focus-visible { outline: 1.5px solid var(--accent); outline-offset: 1px; 
   animation: pulse 1.2s ease-in-out infinite;
 }
 #stream[hidden] { display: none; }
+
+/* Destination host shown after model-written links. */
+.link-host { color: var(--muted, #888); font-size: 0.85em; }

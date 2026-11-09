@@ -31,6 +31,11 @@ final class ChatEngine: ObservableObject {
 
     // Limits
     private static let maxTurnsPerConversation = 150
+    /// Rough request budget (system + history + new turn), in estimated tokens, leaving room
+    /// for the answer inside a 200k context window. Estimated as UTF-8 bytes / 3 (conservative).
+    private static let maxPromptTokens = 200_000 - maxTokens - 8_000
+    /// Streaming text is published to the UI at most this often (deltas are coalesced).
+    private static let streamPublishInterval: Duration = .milliseconds(50)
     private static let maxTokens = 16000
     private static let retrievalCount = 6
     private static let maxRetrievedChars = 1200
@@ -56,6 +61,9 @@ final class ChatEngine: ObservableObject {
     private var pendingTurn: ChatTurn?
     /// Bumped on every send/cancel/reset so a superseded task never touches state.
     private var generation = 0
+    /// Accumulated answer text; published to `streamingText` on a short timer.
+    private var streamBuffer = ""
+    private var streamFlush: Task<Void, Never>?
 
     init(paper: Paper, context: ModelContext) {
         self.paperId = paper.id
@@ -66,7 +74,8 @@ final class ChatEngine: ObservableObject {
         self.context = context
         self.conversationId = UUID()
         loadLatestConversation()
-        frozenSystem = buildSystem()
+        // The frozen system prompt is built lazily on the first send: opening a paper must not
+        // read and serialise the whole text on the main thread if the user never chats.
     }
 
     // MARK: Public API
@@ -108,6 +117,7 @@ final class ChatEngine: ObservableObject {
         task?.cancel()
         task = nil
         rollbackPendingTurn()
+        stopStreamFlush()
         streamingText = nil
         isThinking = false
     }
@@ -127,8 +137,13 @@ final class ChatEngine: ObservableObject {
             errorText = "The paper's text isn't ready yet. Try again once it has finished importing."
             return
         }
-        if turns.count >= Self.maxTurnsPerConversation {
+        // Size guard: the whole history is replayed every turn, so cap its estimated size
+        // (and turn count) and start a fresh conversation before the request would overflow.
+        let historyBytes = turns.reduce(0) { $0 + $1.contentJSON.count }
+        let estimated = (system.count + historyBytes + question.utf8.count + 8 * 1200) / 3
+        if !turns.isEmpty, turns.count >= Self.maxTurnsPerConversation || estimated > Self.maxPromptTokens {
             newConversation()
+            errorText = "Started a new chat: the previous one reached the length limit."
         }
 
         // History must be valid JSON arrays before it is spliced into the request.
@@ -171,7 +186,16 @@ final class ChatEngine: ObservableObject {
         turns.append(userTurn)
         pendingTurn = userTurn
         messages.append(Self.display(userTurn))
-        history.append(["role": "user", "content": ClaudeRawJSON(data: contentJSON)])
+        // Cache breakpoint at the end of the conversation so the next turn reads the whole
+        // prefix (paper + history) from cache. Added to the request copy only; the stored
+        // contentJSON stays byte-stable. (System block holds the other breakpoint.)
+        var requestContent = content
+        if var last = requestContent.popLast() {
+            last["cache_control"] = ["type": "ephemeral"]
+            requestContent.append(last)
+        }
+        let requestContentJSON = (try? ClaudeJSON.data(requestContent)) ?? contentJSON
+        history.append(["role": "user", "content": ClaudeRawJSON(data: requestContentJSON)])
 
         let body: [String: Any] = [
             "max_tokens": Self.maxTokens,
@@ -182,6 +206,7 @@ final class ChatEngine: ObservableObject {
 
         generation += 1
         let gen = generation
+        stopStreamFlush()
         streamingText = ""
         isThinking = false
 
@@ -194,8 +219,8 @@ final class ChatEngine: ObservableObject {
                     case .thinking:
                         self.isThinking = true
                     case .textDelta(let t):
-                        self.isThinking = false
-                        self.streamingText = (self.streamingText ?? "") + t
+                        if self.isThinking { self.isThinking = false }
+                        self.appendStreamed(t, gen: gen)
                     case .done(let json, let text, let stopReason):
                         self.finish(gen: gen, contentJSON: json, text: text, stopReason: stopReason, kind: kind)
                         return
@@ -247,6 +272,7 @@ final class ChatEngine: ObservableObject {
         turns.append(assistantTurn)
         pendingTurn = nil
         messages.append(Self.display(assistantTurn))
+        stopStreamFlush()
         streamingText = nil
         isThinking = false
     }
@@ -255,9 +281,31 @@ final class ChatEngine: ObservableObject {
         guard generation == gen else { return }
         task = nil
         rollbackPendingTurn()
+        stopStreamFlush()
         streamingText = nil
         isThinking = false
         errorText = (error as? LocalizedError)?.errorDescription ?? error.localizedDescription
+    }
+
+    // MARK: Streaming coalescing
+
+    /// Buffers a text delta and publishes the accumulated text at most every 50 ms, so the
+    /// panel and chat web view update at a frame-like rate instead of once per token.
+    private func appendStreamed(_ t: String, gen: Int) {
+        streamBuffer += t
+        guard streamFlush == nil else { return }
+        streamFlush = Task { [weak self] in
+            try? await Task.sleep(for: Self.streamPublishInterval)
+            guard let self, !Task.isCancelled, self.generation == gen else { return }
+            self.streamFlush = nil
+            if self.streamingText != nil { self.streamingText = self.streamBuffer }
+        }
+    }
+
+    private func stopStreamFlush() {
+        streamFlush?.cancel()
+        streamFlush = nil
+        streamBuffer = ""
     }
 
     /// Deletes the unanswered user turn. It is always the tail, so history stays append-only.

@@ -229,6 +229,9 @@ struct LibrarySidebar: View {
         if paper.importState == .failed {
             Button("Retry Import") { Importer.shared.retry(paper, context: context) }
         }
+        if Importer.shared.canRetryReferences(paper) {
+            Button("Retry References") { Importer.shared.retryReferences(paper, context: context) }
+        }
         Divider()
         if paper.hasPDF {
             Button("Show PDF in Finder") {
