@@ -332,3 +332,99 @@ Messages to Swift: `chat` handler: `{type:"ready"}`, `{type:"jumpToBlock", b}`, 
 its own 600s timeout, so B may create its own `URLSession` in ClaudeClient.
 
 Never edit another module's files; if a contract is insufficient, note it in the final report.
+
+## 8. Reading position + reader typography
+
+**Model** (`Paper`, optional fields with `nil` defaults so SwiftData lightweight-migrates old
+stores): `readingBlock: Int?` (data-b of the top-most visible block), `readingBlockFraction:
+Double?` (0–1 progress through that block — survives font-size/width changes),
+`pdfPageIndex: Int?` (0-based), `lastViewModeRaw: String?` (`"text"|"pdf"`).
+
+**Reader JS additions** (`reader.js`):
+- `Reader.load({html, highlights, position?: {b, frac}, prefs?})` → `{maxBlock}` (highest
+  data-b, -1 if none). Prefs are applied before the content is inserted; the position is
+  restored before math renders and then *held*: a `ResizeObserver` on `#paper` re-applies it
+  after every layout change (KaTeX batches, lazy images, prefs, width changes) and once more
+  when the render queue drains, until the user scrolls (wheel / touch / mousedown / navigation
+  keys / a scrollbar drag detected as an unexplained scroll with unchanged document height).
+  Without a hold, layout changes keep the last measured anchor in place (scrollBy the layout
+  delta above it; re-apply the fraction if the anchor block itself reflowed).
+- `Reader.setPrefs({fontSize 14–26, measure narrow|normal|wide, font serif|sans,
+  lineHeight compact|normal|relaxed})` — captures the position, sets CSS custom properties on
+  `:root` (`--reader-size`, `--reader-measure` 58/68/80ch, `--reader-font`, `--reader-leading`
+  1.48/1.62/1.8), restores and holds the position. Headings are em-sized so they scale.
+- `Reader.getPosition()` → `{b, frac}` or null.
+- Message `{type:"position", b, frac}`: computed in a rAF on a passive scroll listener, posted
+  at most every 250 ms (trailing), deduplicated, never while holding.
+- A 1px accent progress hairline is fixed to the top edge of the reader (`#progress`).
+
+**Swift**: `WebReader.Coordinator` validates position messages (`WebBridge.readerPosition`:
+`b` integer in `0...maxBlock`, `frac` finite in 0…1, booleans rejected) and forwards them to
+`PaperSession.recordTextPosition`. `PaperSession` keeps the pending text position / PDF page
+and writes them to the `Paper` with a trailing ~1 s throttle (one `context.save` at most per
+second while scrolling); `flushPosition()` saves immediately and runs on paper switch
+(`close()`), mode toggle (`recordViewMode`, which first fetches the live
+`Reader.getPosition()` when leaving the text view), window close, app deactivation (live
+fetch) and termination (`PaperreadsAppDelegate`). `PDFKitView` takes `initialPage` (read per
+document load, clamped) and `onPageChange` (from `PDFViewPageChanged`, ignored until the
+restore has been applied after the first layout). `AppCommands.syncSession` reopens a paper in
+its `lastViewModeRaw` when that view is available (PDF needs `hasPDF`, text needs ready
+content), else the previous fallback; `readerMode`'s `didSet` records user mode changes.
+
+**Typography prefs** (global, `ReaderPreferences.shared` in `WebReader.swift`, UserDefaults
+keys `reader.fontSize|measure|font|lineHeight`; not in config.json): header "Aa" text button →
+popover with `A− · size · A+`, Width (Narrow·Normal·Wide), Font (Serif·Sans), Spacing
+(Compact·Normal·Relaxed), Reset. View menu: Larger Text ⌘+ (⌘= via a local key monitor in the
+app delegate), Smaller Text ⌘−, Actual Size ⌘0 (resets size only). `WebReader` sends prefs in
+every `Reader.load` and calls `Reader.setPrefs` (JSON arguments via `callAsyncJavaScript`) when
+they change.
+
+## 9. Notes editor & Markdown notes files
+
+**Editor (`Views/MarkdownEditor.swift`).** `MarkdownEditor` (NSViewRepresentable over a TextKit 1
+`NSTextView` in a transparent `NSScrollView`) replaces the SwiftUI `TextEditor` for
+`Paper.paperNotes`. The stored string is plain Markdown; styling is attributes only, applied in
+`NSTextStorageDelegate.willProcessEditing` to the edited paragraph range(s) only (`MarkdownStyler`):
+`#`/`##`/`###` serif semibold 22/18/16, list lines (`-`, `*`, `•`, `+`, `1.`, `1)`, `- [ ]`) with
+a hanging indent (checked `[x]` items struck through, faint), `> ` quotes muted + indented,
+`**bold**`, `*italic*`, `` `code` `` monospaced; Markdown markers are drawn faint. Body is SF Pro
+Rounded 14. All automatic dash/quote substitution, text replacement, autocorrect, link and data
+detection are off. Editing (`MarkdownEditing`): Return continues list/quote markers (numbers
+increment, `- [ ]`/`- [x]` continue as `- [ ] `), Return on an empty item removes the marker,
+Tab/Shift-Tab on list lines indent/outdent by two spaces, ⌘B/⌘I wrap/unwrap the selection in
+`**`/`*`. `MarkdownFormatBar` (`H1  H2  •  1.  ☐`) toggles the prefix of the current line(s) via
+`MarkdownEditorController`. Every programmatic edit goes through `shouldChangeText` /
+`didChangeText`, so undo works. Binding sync: the coordinator remembers the last string it pushed
+(`lastSynced`); `updateNSView` replaces the text only when the binding differs from both the view
+and `lastSynced` (a genuinely external change, e.g. pulled from the file), preserving selection.
+Highlight notes use `PlainNoteField` (self-sizing NSTextView, substitutions off) instead of a
+SwiftUI `TextField`, whose shared field editor can't turn off dash substitution per field.
+
+**Files (`Services/NotesFiles.swift`).** One Markdown file per paper in the notes folder —
+default `~/Paperreads/Notes` (not Documents/Desktop/Downloads: TCC-protected, and this ad-hoc
+signed app would re-prompt after every rebuild); changeable in Settings (NSOpenPanel, stored in
+`UserDefaults` key `notesFolderPath`; Settings also has Reveal in Finder, Use default, Export all
+now). Name: `<sanitized title ≤80> [<first 8 of uuid, lowercase>].md`; the bracketed suffix is the
+key, so a title change renames the existing file. Content: YAML front matter (`title`, `authors`,
+`year`, `arxiv`, `doi`, `status`, `tags`, `paperreads_id`; strings JSON-style escaped, nil fields
+omitted), `# title`, `## Notes` (paperNotes verbatim), `## Highlights` (each quote as `> ` lines,
+then `note — ¶<block>` or `¶<block>`; generated lines starting `#`/`>`/`---` are backslash-escaped
+so the last `## Highlights` line always delimits the Notes section).
+All IO runs on a private serial queue with value `Snapshot`s; writes are atomic and skipped when
+the content is unchanged. Index: `Application Support/Paperreads/notes-index.json`
+(paperId → folder, filename, content hash, Notes-section hash, mtime). `NotesPanel` reconciles on
+appear, ~1 s after any change to notes/highlights/title/tags/status, on disappear (async), and
+synchronously on `willTerminate`. Two-way rule: if the file's mtime is newer than our last write
+and its Notes section differs from what we wrote, and the in-app notes are unchanged since that
+write, the file's Notes section replaces `paper.paperNotes` (external editor wins; highlights are
+always regenerated). If both sides changed, or the file was edited so its Notes section can't be
+found, the external file is first copied to `<name> conflict <timestamp>.md`, then the app's
+version is written — nothing is lost. Write failures show as quiet inline text under the editor.
+The panel's "Open file" / "Reveal" buttons sync first, then open / reveal the file.
+**Deleting a paper does not delete its notes file** (it is user data); changing the folder leaves
+files in the old folder untouched. Files are written by the Notes panel, by Export all, and (without
+pulling) by `PaperSession.addHighlight` / `deleteHighlight`, so highlight changes reach the file
+even while the Ask tab is showing. Title/tag/status edits made elsewhere refresh the file the next
+time that paper's Notes panel appears or on Export all.
+(§5's `Reader.load` signature is superseded by §8: it also takes `position`/`prefs` and returns
+`{maxBlock}`.)

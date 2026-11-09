@@ -1,4 +1,5 @@
 import SwiftUI
+import AppKit
 import NaturalLanguage
 
 /// ⌘, — API key, model, embedding status. Persisted via `AppSettings.save()` (0600 file,
@@ -15,6 +16,12 @@ struct SettingsView: View {
         guard let env = ProcessInfo.processInfo.environment["ANTHROPIC_API_KEY"] else { return false }
         return !env.isEmpty
     }
+
+    /// Notes folder (NotesFiles) — applied immediately, not part of Save.
+    @State private var notesFolder = NotesFiles.folder
+    @State private var exporting = false
+    @State private var exportStatus: String?
+    @State private var exportFailed = false
 
     /// Loaded once (the model is cached by Embedder), not on every body evaluation.
     @State private var embeddingsAvailable = Embedder.isAvailable
@@ -85,6 +92,41 @@ struct SettingsView: View {
                     .fixedSize(horizontal: false, vertical: true)
             }
 
+            section("Notes folder") {
+                Text(NotesFiles.displayPath(notesFolder))
+                    .font(.rounded(14))
+                    .foregroundStyle(Theme.ink)
+                    .lineLimit(2)
+                    .truncationMode(.middle)
+                    .textSelection(.enabled)
+                Text("Each paper's notes and highlights are kept as a Markdown file here. Edits you make to the Notes section of a file are pulled back in when you next open that paper's notes. Deleting a paper never deletes its file.")
+                    .font(.rounded(12))
+                    .foregroundStyle(Theme.faint)
+                    .fixedSize(horizontal: false, vertical: true)
+                HStack(spacing: Theme.Space.m) {
+                    Button("Reveal in Finder", action: revealNotesFolder)
+                        .buttonStyle(.text)
+                    Button("Change…", action: chooseNotesFolder)
+                        .buttonStyle(.text)
+                    if notesFolder.standardizedFileURL.path != NotesFiles.defaultFolder.standardizedFileURL.path {
+                        Button("Use default") { setNotesFolder(nil) }
+                            .buttonStyle(.text)
+                    }
+                    Button(exporting ? "Exporting…" : "Export all now", action: exportAll)
+                        .buttonStyle(.text)
+                        .disabled(exporting)
+                    Spacer(minLength: 0)
+                }
+                .padding(.top, Theme.Space.xxs)
+                if let exportStatus {
+                    Text(exportStatus)
+                        .font(.rounded(12))
+                        .foregroundStyle(exportFailed ? Theme.danger : Theme.muted)
+                        .fixedSize(horizontal: false, vertical: true)
+                        .textSelection(.enabled)
+                }
+            }
+
             HStack(spacing: Theme.Space.m) {
                 Spacer()
                 if saved && !isDirty {
@@ -103,6 +145,65 @@ struct SettingsView: View {
             settings.load()
             keyDraft = settings.apiKey
             modelDraft = settings.model
+            notesFolder = NotesFiles.folder
+        }
+    }
+
+    // MARK: Notes folder
+
+    private func revealNotesFolder() {
+        let folder = NotesFiles.folder
+        do {
+            try FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)
+            NSWorkspace.shared.activateFileViewerSelecting([folder])
+        } catch {
+            exportFailed = true
+            exportStatus = "Couldn't create \(NotesFiles.displayPath(folder)): \(error.localizedDescription)"
+        }
+    }
+
+    private func chooseNotesFolder() {
+        let panel = NSOpenPanel()
+        panel.canChooseDirectories = true
+        panel.canChooseFiles = false
+        panel.canCreateDirectories = true
+        panel.allowsMultipleSelection = false
+        panel.prompt = "Use Folder"
+        panel.message = "Choose where Paperreads keeps your notes as Markdown files."
+        let current = NotesFiles.folder
+        panel.directoryURL = FileManager.default.fileExists(atPath: current.path)
+            ? current : current.deletingLastPathComponent()
+        guard panel.runModal() == .OK, let url = panel.url else { return }
+        setNotesFolder(url)
+    }
+
+    private func setNotesFolder(_ url: URL?) {
+        NotesFiles.setFolder(url)
+        notesFolder = NotesFiles.folder
+        exportStatus = nil
+        exportFailed = false
+        // Populate the new folder right away (existing files elsewhere are left untouched).
+        exportAll()
+    }
+
+    private func exportAll() {
+        guard !exporting else { return }
+        exporting = true
+        exportStatus = nil
+        exportFailed = false
+        let snapshots = NotesFiles.allSnapshots()
+        Task { @MainActor in
+            let result = await NotesFiles.exportAll(snapshots)
+            exporting = false
+            if result.failures.isEmpty {
+                exportStatus = result.count == 1 ? "1 notes file is up to date." : "\(result.count) notes files are up to date."
+                exportFailed = false
+            } else {
+                exportFailed = true
+                let first = result.failures.prefix(3).joined(separator: "\n")
+                let more = result.failures.count > 3 ? "\n…and \(result.failures.count - 3) more." : ""
+                exportStatus = "\(result.failures.count) of \(result.count + result.failures.count) files couldn't be written.\n\(first)\(more)"
+            }
         }
     }
 

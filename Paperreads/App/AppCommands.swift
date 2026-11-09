@@ -34,6 +34,14 @@ final class PaperSession: ObservableObject {
 
     private var engineBuiltBeforeReady: Bool
 
+    // Reading position: recorded on every (throttled) report, written to the Paper at most
+    // once per `positionSaveDelay`, and flushed on switch / mode toggle / close / quit.
+    private static let positionSaveDelay: UInt64 = 1_000_000_000
+    private var pendingTextPosition: ReaderPosition?
+    private var pendingPDFPage: Int?
+    private var positionSaveTask: Task<Void, Never>?
+    private var isClosed = false
+
     init(paper: Paper, context: ModelContext) {
         self.paper = paper
         self.paperID = paper.id
@@ -44,9 +52,97 @@ final class PaperSession: ObservableObject {
 
     func close() {
         chat.cancel()
+        flushPosition()
+        isClosed = true
         reader.detach()
         try? context.save()
     }
+
+    // MARK: Reading position
+
+    /// Where the text reader should open: the latest unsaved report, else the stored one.
+    func savedTextPosition() -> ReaderPosition? {
+        if let pending = pendingTextPosition { return pending }
+        guard isPaperAlive, let b = paper.readingBlock, b >= 0 else { return nil }
+        let frac = paper.readingBlockFraction ?? 0
+        return ReaderPosition(block: b, fraction: frac.isFinite ? min(max(frac, 0), 1) : 0)
+    }
+
+    /// Where the PDF view should open (0-based page; the view clamps it to the page count).
+    func savedPDFPage() -> Int? {
+        if let pending = pendingPDFPage { return pending }
+        guard isPaperAlive, let page = paper.pdfPageIndex, page >= 0 else { return nil }
+        return page
+    }
+
+    func recordTextPosition(_ position: ReaderPosition) {
+        pendingTextPosition = position
+        schedulePositionSave()
+    }
+
+    func recordPDFPage(_ index: Int) {
+        guard index >= 0 else { return }
+        pendingPDFPage = index
+        schedulePositionSave()
+    }
+
+    /// Remembers the mode the user chose for this paper and saves the position right away.
+    func recordViewMode(_ mode: ReaderMode) {
+        guard !isClosed, isPaperAlive else { return }
+        if paper.lastViewModeRaw != mode.rawValue { paper.lastViewModeRaw = mode.rawValue }
+        if mode == .pdf {
+            // Leaving the text view: take its exact live position first (it stays loaded, hidden).
+            Task { [weak self] in
+                guard let self else { return }
+                if let live = await self.reader.currentPosition(), !self.isClosed {
+                    self.pendingTextPosition = live
+                }
+                self.flushPosition(force: true)
+            }
+        } else {
+            flushPosition(force: true)
+        }
+    }
+
+    /// Writes any pending position to the Paper and saves (no-op when nothing changed).
+    func flushPosition(force: Bool = false) {
+        positionSaveTask?.cancel()
+        positionSaveTask = nil
+        guard isPaperAlive else {
+            pendingTextPosition = nil
+            pendingPDFPage = nil
+            return
+        }
+        var changed = false
+        if let p = pendingTextPosition {
+            if paper.readingBlock != p.block { paper.readingBlock = p.block; changed = true }
+            if paper.readingBlockFraction != p.fraction { paper.readingBlockFraction = p.fraction; changed = true }
+            pendingTextPosition = nil
+        }
+        if let page = pendingPDFPage {
+            if paper.pdfPageIndex != page { paper.pdfPageIndex = page; changed = true }
+            pendingPDFPage = nil
+        }
+        if changed || (force && context.hasChanges) { try? context.save() }
+    }
+
+    private func schedulePositionSave() {
+        if isClosed {
+            // A late report from the page after the switch: write it straight through.
+            flushPosition()
+            return
+        }
+        // Trailing throttle: at most one save per interval, even while scrolling continuously.
+        guard positionSaveTask == nil else { return }
+        positionSaveTask = Task { [weak self] in
+            try? await Task.sleep(nanoseconds: Self.positionSaveDelay)
+            guard !Task.isCancelled, let self else { return }
+            self.positionSaveTask = nil
+            self.flushPosition()
+        }
+    }
+
+    private var isPaperAlive: Bool { !paper.isDeleted && paper.modelContext != nil }
 
     var isChatBusy: Bool { chat.streamingText != nil || chat.isThinking }
 
@@ -77,12 +173,20 @@ final class PaperSession: ObservableObject {
         context.insert(h)
         try? context.save()
         focusedHighlightID = h.id
+        syncNotesFile()
     }
 
     func deleteHighlight(_ h: Highlight) {
         if focusedHighlightID == h.id { focusedHighlightID = nil }
         context.delete(h)
         try? context.save()
+        syncNotesFile()
+    }
+
+    /// Keeps the paper's Markdown notes file current when highlights change outside the Notes panel.
+    private func syncNotesFile() {
+        let snap = NotesFiles.snapshot(of: paper, in: context)
+        Task { _ = await NotesFiles.sync(snap, allowPull: false) }
     }
 
     /// Sends the composer text, folding in a pending "Ask about this passage" quote.
@@ -109,13 +213,20 @@ final class AppCommands: ObservableObject {
     @Published var showPDFImporter = false
     @Published var sidePanelVisible = true
     @Published var sidePanelTab: SidePanelTab = .ask
-    @Published var readerMode: ReaderMode = .text
+    @Published var readerMode: ReaderMode = .text {
+        didSet {
+            guard readerMode != oldValue, !isRestoringMode else { return }
+            session?.recordViewMode(readerMode)
+        }
+    }
     @Published var selectedPaperID: UUID?
     @Published private(set) var session: PaperSession?
     /// Transient, non-modal message (e.g. a dropped file that isn't a PDF).
     @Published var notice: String?
 
     private var didLaunch = false
+    /// Set while `syncSession` picks the mode for a newly opened paper (not a user choice).
+    private var isRestoringMode = false
     private var noticeTask: Task<Void, Never>?
 
     private init() {}
@@ -143,7 +254,17 @@ final class AppCommands: ObservableObject {
         paper.lastOpenedAt = Date()
         try? context.save()
         let hasText = paper.importState == .ready && paper.contentKind != .none
-        readerMode = (!hasText && paper.hasPDF && !paper.importState.isBusy) ? .pdf : .text
+        let fallback: ReaderMode = (!hasText && paper.hasPDF && !paper.importState.isBusy) ? .pdf : .text
+        // Reopen in the mode last chosen for this paper, when that view is available.
+        let mode: ReaderMode
+        switch paper.lastViewModeRaw.flatMap(ReaderMode.init(rawValue:)) {
+        case .pdf? where paper.hasPDF: mode = .pdf
+        case .text? where hasText: mode = .text
+        default: mode = fallback
+        }
+        isRestoringMode = true
+        readerMode = mode
+        isRestoringMode = false
         session = PaperSession(paper: paper, context: context)
     }
 
@@ -221,6 +342,25 @@ final class AppCommands: ObservableObject {
         readerMode = readerMode == .text ? .pdf : .text
     }
 
+    /// Saves the open paper's reading position now (window close, app termination).
+    func flushReadingPosition() {
+        session?.flushPosition(force: true)
+    }
+
+    /// Saves the open paper's exact live text position (app deactivation): asks the reader
+    /// for it first, since the last throttled report may be up to 250 ms old.
+    func flushReadingPositionFetchingLatest() {
+        guard let session else { return }
+        guard readerMode == .text else { session.flushPosition(force: true); return }
+        Task { [weak session] in
+            guard let session else { return }
+            if let live = await session.reader.currentPosition() {
+                session.recordTextPosition(live)
+            }
+            session.flushPosition(force: true)
+        }
+    }
+
     func show(_ tab: SidePanelTab) {
         sidePanelTab = tab
         if !sidePanelVisible { toggleSidePanel() }
@@ -283,6 +423,7 @@ final class AppCommands: ObservableObject {
 
 struct PaperreadsCommands: Commands {
     @ObservedObject var app: AppCommands
+    @ObservedObject var prefs: ReaderPreferences
 
     var body: some Commands {
         CommandGroup(replacing: .newItem) {
@@ -301,6 +442,17 @@ struct PaperreadsCommands: Commands {
             Button(app.readerMode == .text ? "Show Original PDF" : "Show Clean Text") { app.toggleReaderMode() }
                 .keyboardShortcut("p", modifiers: [.command, .shift])
                 .disabled(app.session == nil)
+            Divider()
+            // ⌘= is also handled (PaperreadsAppDelegate), since ⌘+ needs Shift on most layouts.
+            Button("Larger Text") { prefs.increase() }
+                .keyboardShortcut("+", modifiers: .command)
+                .disabled(!prefs.canIncrease)
+            Button("Smaller Text") { prefs.decrease() }
+                .keyboardShortcut("-", modifiers: .command)
+                .disabled(!prefs.canDecrease)
+            Button("Actual Size") { prefs.actualSize() }
+                .keyboardShortcut("0", modifiers: .command)
+                .disabled(prefs.isDefaultSize)
             Divider()
         }
 

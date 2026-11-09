@@ -166,6 +166,23 @@ enum WebBridge {
         return ReaderSelection(quote: quote, blockIndex: block, startOffset: offset, contextText: context)
     }
 
+    /// A JS number that is finite and within 0…1 (rejects booleans, NaN, ±Infinity).
+    static func fraction(_ value: Any?) -> Double? {
+        guard let n = value as? NSNumber, CFGetTypeID(n) != CFBooleanGetTypeID() else { return nil }
+        let d = n.doubleValue
+        guard d.isFinite, d >= 0, d <= 1 else { return nil }
+        return d
+    }
+
+    /// Validates a reading position `{b, frac}` reported by the reader. `b` must be a
+    /// non-negative integer no greater than the loaded content's highest block number.
+    static func readerPosition(_ value: Any?, maxBlock: Int) -> ReaderPosition? {
+        guard maxBlock >= 0, let dict = value as? [String: Any],
+              let b = int(dict["b"], in: 0...maxBlock),
+              let frac = fraction(dict["frac"]) else { return nil }
+        return ReaderPosition(block: b, fraction: frac)
+    }
+
     // MARK: JS calls
 
     /// `callAsyncJavaScript` with JSON-encoded arguments (never string-interpolated JS).

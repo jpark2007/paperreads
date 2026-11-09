@@ -69,7 +69,9 @@ struct ReaderView: View {
     @ViewBuilder
     private var pdfLayer: some View {
         if paper.hasPDF {
-            PDFKitView(url: PaperStore.pdfURLForReading(paper.id))
+            PDFKitView(url: PaperStore.pdfURLForReading(paper.id),
+                       initialPage: { [session] in session.savedPDFPage() },
+                       onPageChange: { [session] in session.recordPDFPage($0) })
                 .background(Theme.bg)
         } else {
             ReaderMessage(
@@ -89,6 +91,7 @@ private struct ReaderTextContent: View {
     @ObservedObject var session: PaperSession
     let page: URL
     @EnvironmentObject private var app: AppCommands
+    @ObservedObject private var prefs = ReaderPreferences.shared
     @Query private var highlights: [Highlight]
     /// Paper whose text kept crashing the web content process (reloading has stopped).
     @State private var crashedPaper: UUID?
@@ -126,8 +129,11 @@ private struct ReaderTextContent: View {
             contentToken: "\(paper.contentKindRaw)|\(paper.importStateRaw)",
             highlights: highlights.filter { $0.paperId == paper.id }.map(ReaderHighlightPayload.init),
             bridge: session.reader,
+            prefs: prefs.typography,
+            savedPosition: { [session] in session.savedTextPosition() },
             onSelection: { action, selection in app.handleReaderSelection(action, selection) },
             onHighlightClicked: { app.highlightClicked($0) },
+            onPosition: { [session] in session.recordTextPosition($0) },
             onContentCrashed: { [paperID = paper.id] in crashedPaper = paperID }
         )
     }
@@ -187,6 +193,8 @@ private struct ReaderHeader: View {
                     .buttonStyle(.text)
                 }
                 Spacer(minLength: 0)
+                TypographyButton()
+                    .disabled(app.readerMode != .text)
                 if let source = sourceURL {
                     Button("Source") { WebBridge.openExternally(source) }
                         .buttonStyle(.text)
@@ -227,6 +235,81 @@ private struct ReaderHeader: View {
             return URL(string: "https://arxiv.org/abs/\(enc)")
         }
         return nil
+    }
+}
+
+/// Quiet "Aa" text button: text size, width, font and spacing for the clean-text reader.
+private struct TypographyButton: View {
+    @ObservedObject private var prefs = ReaderPreferences.shared
+    @State private var open = false
+
+    var body: some View {
+        Button("Aa") { open.toggle() }
+            .buttonStyle(.text)
+            .help("Text size, width, font and spacing (⌘+ / ⌘− / ⌘0)")
+            .accessibilityLabel("Reader typography")
+            .popover(isPresented: $open, arrowEdge: .bottom) {
+                TypographyPanel(prefs: prefs)
+            }
+    }
+}
+
+private struct TypographyPanel: View {
+    @ObservedObject var prefs: ReaderPreferences
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: Theme.Space.m) {
+            row("Text size") {
+                HStack(spacing: Theme.Space.s) {
+                    Button("A−") { prefs.decrease() }
+                        .buttonStyle(TextButtonStyle(size: 13, weight: .semibold))
+                        .disabled(!prefs.canDecrease)
+                        .help("Smaller text (⌘−)")
+                        .accessibilityLabel("Smaller text")
+                    Text("\(prefs.fontSize)")
+                        .font(.rounded(14, weight: .semibold))
+                        .monospacedDigit()
+                        .foregroundStyle(Theme.ink)
+                        .frame(minWidth: 26)
+                        .accessibilityLabel("Text size \(prefs.fontSize) points")
+                    Button("A+") { prefs.increase() }
+                        .buttonStyle(TextButtonStyle(size: 16, weight: .semibold))
+                        .disabled(!prefs.canIncrease)
+                        .help("Larger text (⌘+)")
+                        .accessibilityLabel("Larger text")
+                }
+                .frame(height: 30)
+            }
+            row("Width") {
+                TextSegmented(options: ReaderMeasure.allCases.map { ($0, $0.label) },
+                              selection: $prefs.measure)
+            }
+            row("Font") {
+                TextSegmented(options: ReaderFontChoice.allCases.map { ($0, $0.label) },
+                              selection: $prefs.font)
+            }
+            row("Spacing") {
+                TextSegmented(options: ReaderLineSpacing.allCases.map { ($0, $0.label) },
+                              selection: $prefs.lineHeight)
+            }
+            Hairline()
+            HStack {
+                Spacer(minLength: 0)
+                Button("Reset") { prefs.reset() }
+                    .buttonStyle(.text)
+                    .disabled(prefs.isDefault)
+            }
+        }
+        .padding(Theme.Space.m)
+        .frame(minWidth: 280, alignment: .leading)
+        .background(Theme.bg)
+    }
+
+    private func row<Content: View>(_ label: String, @ViewBuilder content: () -> Content) -> some View {
+        VStack(alignment: .leading, spacing: Theme.Space.xs) {
+            Text(label).capsLabel()
+            content()
+        }
     }
 }
 

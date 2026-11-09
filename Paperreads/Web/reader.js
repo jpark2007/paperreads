@@ -2,7 +2,10 @@
  * Paperreads — reader page (module A). Hosted in a WKWebView loaded with loadFileURL.
  *
  * API (called from Swift):
- *   Reader.load({html, highlights:[{id, blockIndex, startOffset, quote}]}) → true
+ *   Reader.load({html, highlights:[{id, blockIndex, startOffset, quote}], position?:{b, frac}, prefs?})
+ *                                                                      → {maxBlock}
+ *   Reader.setPrefs({fontSize, measure, font, lineHeight})             → true (keeps the reading anchor)
+ *   Reader.getPosition()                                               → {b, frac} | null
  *   Reader.addHighlight({id, blockIndex, startOffset, quote})          → Bool (applied)
  *   Reader.removeHighlight(id)
  *   Reader.scrollToBlock(b)                                            → Bool
@@ -13,6 +16,12 @@
  *   {type:"ready"}
  *   {type:"selection", action:"highlight"|"explain"|"ask", selection:{quote, blockIndex, startOffset, contextText}}
  *   {type:"highlightClicked", id}
+ *   {type:"position", b, frac}      top-most visible block + progress through it (0–1), throttled
+ *
+ * Reading anchor: a position is "held" after Reader.load(position) and Reader.setPrefs — every
+ * later layout change (KaTeX batches, late images, window/panel resizes) re-applies it until the
+ * user scrolls. Without a hold, layout changes re-apply the last position seen while scrolling,
+ * so the line being read stays put when content above it changes height.
  *
  * Offsets are measured in Paperreads.linearize(block).text — the same function that produced
  * blocks.json — so a stored highlight always maps back onto the same characters. Multi-block
@@ -33,6 +42,19 @@
   let linCache = new WeakMap(); // block → linearisation (invalidated on DOM mutation)
   let cancelMath = null;
   const highlights = new Map(); // id → {id, blockIndex, startOffset, quote}
+
+  // reading position (see header comment)
+  const POST_INTERVAL = 250;   // ms between position messages (minimum)
+  let hold = null;             // {b, frac} re-applied on layout changes until the user scrolls
+  let lastKnown = null;        // last position measured while scrolling
+  let lastPosted = null;
+  let lastPostAt = 0;
+  let postTimer = 0;
+  let scrollRaf = 0;
+  let expectedY = 0;           // scrollY right after our own restore
+  let expectedH = 0;           // scrollHeight right after our own restore
+  let suppressRestoreUntil = 0; // after scrollToBlock: let the smooth scroll run
+  let progressBar = null;
 
   // ---------------------------------------------------------------- helpers
 
@@ -80,6 +102,211 @@
       t.parentNode.insertBefore(w, t);
       w.appendChild(t);
     });
+  }
+
+  // ---------------------------------------------------------------- typography prefs
+
+  const MEASURES = { narrow: '58ch', normal: '68ch', wide: '80ch' };
+  const FONTS = { serif: 'var(--serif)', sans: 'var(--sans)' };
+  const LINE_HEIGHTS = { compact: '1.48', normal: '1.62', relaxed: '1.8' };
+  const DEFAULT_PREFS = { fontSize: 19, measure: 'normal', font: 'serif', lineHeight: 'normal' };
+  let prefs = Object.assign({}, DEFAULT_PREFS);
+
+  function normPrefs(p) {
+    p = P.parseArg(p);
+    const out = Object.assign({}, prefs);
+    if (!p || typeof p !== 'object') return out;
+    const size = toInt(p.fontSize);
+    if (Number.isFinite(size)) out.fontSize = Math.min(26, Math.max(14, size));
+    if (typeof p.measure === 'string' && Object.prototype.hasOwnProperty.call(MEASURES, p.measure)) out.measure = p.measure;
+    if (typeof p.font === 'string' && Object.prototype.hasOwnProperty.call(FONTS, p.font)) out.font = p.font;
+    if (typeof p.lineHeight === 'string' && Object.prototype.hasOwnProperty.call(LINE_HEIGHTS, p.lineHeight)) out.lineHeight = p.lineHeight;
+    return out;
+  }
+
+  /** Applies prefs as CSS custom properties on :root (reader.css reads them). */
+  function applyPrefs(p) {
+    prefs = p;
+    const st = document.documentElement.style;
+    st.setProperty('--reader-size', p.fontSize + 'px');
+    st.setProperty('--reader-measure', MEASURES[p.measure]);
+    st.setProperty('--reader-font', FONTS[p.font]);
+    st.setProperty('--reader-leading', LINE_HEIGHTS[p.lineHeight]);
+    document.documentElement.setAttribute('data-reader-font', p.font);
+  }
+
+  // ---------------------------------------------------------------- reading position
+
+  function firstBlockNumber() { return blocks.length ? blockNumber(blocks[0]) : 0; }
+
+  /** Top-most block visible at the top edge of the viewport, and how far through it we are. */
+  function computePosition() {
+    if (!blocks.length) return null;
+    if (global.scrollY <= 1) return { b: firstBlockNumber(), frac: 0 };
+    let lo = 0;
+    let hi = blocks.length;
+    while (lo < hi) {
+      const mid = (lo + hi) >> 1;
+      if (blocks[mid].getBoundingClientRect().bottom <= 1) lo = mid + 1; else hi = mid;
+    }
+    if (lo >= blocks.length) lo = blocks.length - 1;
+    const el = blocks[lo];
+    const r = el.getBoundingClientRect();
+    let frac = r.height > 0 ? -r.top / r.height : 0;
+    if (!Number.isFinite(frac)) frac = 0;
+    frac = Math.min(1, Math.max(0, frac));
+    return { b: blockNumber(el), frac: Math.round(frac * 10000) / 10000 };
+  }
+
+  /** Like computePosition, plus the anchor block's document geometry for layout-shift fixes. */
+  function measureAnchor() {
+    const pos = computePosition();
+    if (!pos) return null;
+    const el = global.scrollY <= 1 ? null : blockForNumber(pos.b);
+    if (el) {
+      const r = el.getBoundingClientRect();
+      pos.el = el;
+      pos.docTop = r.top + global.scrollY;
+      pos.height = r.height;
+    }
+    return pos;
+  }
+
+  /**
+   * Keeps the last measured anchor in place after a layout change while not holding. Content
+   * that changed height above the anchor is compensated with scrollBy(delta), which leaves
+   * momentum scrolling alone when nothing above moved; a reflow of the anchor block itself
+   * (width change) re-applies the fraction instead.
+   */
+  function keepAnchor(a) {
+    if (!a.el) {
+      if (global.scrollY > 1) global.scrollTo(0, 0);
+      return;
+    }
+    if (!a.el.isConnected) { restorePosition(a); return; }
+    const r = a.el.getBoundingClientRect();
+    if (Math.abs(r.height - a.height) > 1) {
+      restorePosition(a);
+    } else {
+      const delta = r.top + global.scrollY - a.docTop;
+      if (Math.abs(delta) >= 1) global.scrollBy(0, delta);
+    }
+    lastKnown = measureAnchor() || a;
+  }
+
+  /** The block for data-b `b`, or the closest earlier block when it no longer exists. */
+  function blockForNumber(b) {
+    if (posByB.has(b)) return blocks[posByB.get(b)];
+    let best = null;
+    for (let i = 0; i < blocks.length; i++) {
+      const n = blockNumber(blocks[i]);
+      if (n <= b) best = blocks[i]; else break;
+    }
+    return best || blocks[0] || null;
+  }
+
+  function normPosition(pos) {
+    pos = P.parseArg(pos);
+    if (!pos || typeof pos !== 'object') return null;
+    const b = toInt(pos.b);
+    let frac = typeof pos.frac === 'number' ? pos.frac : parseFloat(pos.frac);
+    if (!Number.isFinite(b) || b < 0) return null;
+    if (!Number.isFinite(frac)) frac = 0;
+    return { b: b, frac: Math.min(1, Math.max(0, frac)) };
+  }
+
+  function docHeight() { return document.documentElement.scrollHeight; }
+
+  /** Scrolls so that `frac` of block `b` sits at the top of the viewport. */
+  function restorePosition(pos) {
+    if (!pos || !blocks.length) return false;
+    const el = blockForNumber(pos.b);
+    if (!el) return false;
+    let y = 0;
+    if (!(blockNumber(el) <= firstBlockNumber() && pos.frac <= 0)) {
+      const r = el.getBoundingClientRect();
+      y = Math.max(0, Math.round(r.top + global.scrollY + pos.frac * r.height));
+    }
+    global.scrollTo(0, y);
+    expectedY = global.scrollY;
+    expectedH = docHeight();
+    updateProgress();
+    return true;
+  }
+
+  function releaseHold() { hold = null; }
+
+  function updateProgress() {
+    if (!progressBar) return;
+    const max = docHeight() - global.innerHeight;
+    const p = blocks.length && max > 0 ? Math.min(1, Math.max(0, global.scrollY / max)) : 0;
+    progressBar.style.transform = 'scaleX(' + p.toFixed(4) + ')';
+  }
+
+  function samePosition(a, b) {
+    return !!a && !!b && a.b === b.b && Math.abs(a.frac - b.frac) < 0.005;
+  }
+
+  function postPosition() {
+    postTimer = 0;
+    if (hold || !blocks.length) return;
+    const pos = computePosition();
+    if (!pos) return;
+    lastPostAt = performance.now();
+    if (samePosition(pos, lastPosted)) return;
+    lastPosted = pos;
+    P.postToSwift('reader', { type: 'position', b: pos.b, frac: pos.frac });
+  }
+
+  function schedulePost() {
+    if (postTimer) return;
+    const wait = Math.max(0, POST_INTERVAL - (performance.now() - lastPostAt));
+    postTimer = setTimeout(postPosition, Math.max(wait, 16));
+  }
+
+  function onScrollFrame() {
+    scrollRaf = 0;
+    updateProgress();
+    if (hold || !blocks.length) return;
+    lastKnown = measureAnchor();
+    schedulePost();
+  }
+
+  function onScroll() {
+    if (hold) {
+      // A scroll we did not cause, with the layout unchanged, is the user (e.g. dragging the
+      // scrollbar, which sends no wheel/key events). Layout-caused clamps are left to the observer.
+      if (Math.abs(global.scrollY - expectedY) > 2 && docHeight() === expectedH) releaseHold();
+    }
+    if (!scrollRaf) scrollRaf = requestAnimationFrame(onScrollFrame);
+  }
+
+  const NAV_KEYS = new Set(['ArrowUp', 'ArrowDown', 'PageUp', 'PageDown', 'Home', 'End', ' ', 'Spacebar']);
+
+  global.addEventListener('scroll', onScroll, { passive: true });
+  global.addEventListener('wheel', releaseHold, { passive: true });
+  global.addEventListener('touchstart', releaseHold, { passive: true });
+  document.addEventListener('mousedown', releaseHold, { passive: true });
+  document.addEventListener('keydown', (ev) => { if (NAV_KEYS.has(ev.key)) releaseHold(); }, { passive: true });
+
+  // Every layout change of the paper (math batches, images, prefs, width changes) re-anchors.
+  if (typeof global.ResizeObserver === 'function') {
+    new global.ResizeObserver(() => {
+      if (!blocks.length) return;
+      if (performance.now() < suppressRestoreUntil) return;
+      if (hold) restorePosition(hold);
+      else if (lastKnown) keepAnchor(lastKnown);
+      updateProgress();
+    }).observe(paper);
+  }
+
+  function ensureProgressBar() {
+    if (progressBar) return;
+    progressBar = document.createElement('div');
+    progressBar.id = 'progress';
+    progressBar.setAttribute('data-pr-ui', '');
+    progressBar.setAttribute('aria-hidden', 'true');
+    document.body.appendChild(progressBar);
   }
 
   // ---------------------------------------------------------------- highlight painting
@@ -439,6 +666,16 @@
       hideToolbar();
       highlights.clear();
       invalidate();
+      ensureProgressBar();
+      clearTimeout(postTimer);
+      postTimer = 0;
+      hold = null;
+      lastKnown = null;
+      lastPosted = null;
+      suppressRestoreUntil = 0;
+      applyPrefs(normPrefs(data.prefs));
+      blocks = [];
+      posByB = new Map();
       paper.textContent = '';
       const html = typeof data.html === 'string' ? data.html : '';
       if (!html.trim()) {
@@ -447,7 +684,9 @@
         p.textContent = 'No text to show.';
         paper.appendChild(p);
         indexBlocks();
-        return true;
+        global.scrollTo(0, 0);
+        updateProgress();
+        return { maxBlock: -1 };
       }
       // Content was sanitized at ingest; sanitize again (defence in depth: the file is on disk).
       const src = new DOMParser().parseFromString(html, 'text/html');
@@ -466,8 +705,40 @@
         highlights.set(n.id, n);
         paint(n);
       });
-      cancelMath = P.renderMathProgressive(paper, () => { cancelMath = null; });
+      // Restore before math renders, so the renderer starts with the equations on screen; the
+      // hold then re-anchors after every KaTeX batch and late image until the user scrolls.
+      const pos = normPosition(data.position);
+      if (pos && !(pos.b <= firstBlockNumber() && pos.frac <= 0)) {
+        hold = pos;
+        restorePosition(pos);
+      } else {
+        updateProgress();
+      }
+      cancelMath = P.renderMathProgressive(paper, () => {
+        cancelMath = null;
+        if (hold) restorePosition(hold);
+      });
+      let maxBlock = -1;
+      blocks.forEach((el) => { const n = blockNumber(el); if (Number.isFinite(n) && n > maxBlock) maxBlock = n; });
+      return { maxBlock: maxBlock };
+    },
+
+    setPrefs: function (p) {
+      const next = normPrefs(p);
+      const pos = hold || computePosition();
+      applyPrefs(next);
+      if (pos && blocks.length) {
+        hold = pos;
+        restorePosition(pos);
+      }
+      if (!toolbar.hidden) positionToolbar();
       return true;
+    },
+
+    getPosition: function () {
+      if (!blocks.length) return null;
+      const pos = hold || computePosition();
+      return pos ? { b: pos.b, frac: pos.frac } : null;
     },
 
     addHighlight: function (h) {
@@ -488,6 +759,8 @@
       const n = toInt(P.parseArg(b));
       if (!Number.isFinite(n) || !posByB.has(n)) return false;
       const el = blocks[posByB.get(n)];
+      releaseHold();
+      suppressRestoreUntil = performance.now() + 900;
       scrollIntoViewCentered(el);
       flash(el);
       return true;
@@ -497,6 +770,8 @@
       const key = String(P.parseArg(id));
       const marks = paper.querySelectorAll('mark.hl[data-id="' + cssEscape(key) + '"]');
       if (!marks.length) return false;
+      releaseHold();
+      suppressRestoreUntil = performance.now() + 900;
       scrollIntoViewCentered(marks[0]);
       marks.forEach(flash);
       return true;

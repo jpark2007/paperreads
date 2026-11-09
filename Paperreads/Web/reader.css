@@ -1,10 +1,20 @@
 /* Paperreads — reader page (module A). */
 
+/* Reader typography prefs: set on :root by Reader.setPrefs (defaults match §1). Headings are
+   em-sized in common.css (.prose h2 1.36em, h3 1.14em), so they scale with --reader-size. */
+:root {
+  --sans: -apple-system, "SF Pro Text", system-ui, "Helvetica Neue", sans-serif;
+  --reader-size: 19px;
+  --reader-measure: 68ch;
+  --reader-font: var(--serif);
+  --reader-leading: 1.62;
+}
+
 html { scroll-behavior: auto; }
 
 body {
-  font-size: 19px;
-  line-height: 1.62;
+  font-size: var(--reader-size);
+  line-height: var(--reader-leading);
 }
 
 #column {
@@ -12,10 +22,29 @@ body {
 }
 
 #paper {
-  max-width: 68ch;
+  max-width: var(--reader-measure);
   margin: 0 auto;
-  font-size: 19px;
-  line-height: 1.62;
+  font-family: var(--reader-font);
+  font-size: var(--reader-size);
+  line-height: var(--reader-leading);
+}
+#paper h1, #paper h2, #paper h3, #paper h4 { font-family: var(--reader-font); }
+/* old-style figures suit the serif; the sans reads better with lining figures */
+:root[data-reader-font="sans"] #paper { font-feature-settings: "kern", "liga"; letter-spacing: 0.002em; }
+
+/* reading progress: one accent hairline along the top edge of the reader */
+#progress {
+  position: fixed;
+  top: 0;
+  left: 0;
+  right: 0;
+  height: 1px;
+  background: var(--accent);
+  transform: scaleX(0);
+  transform-origin: 0 50%;
+  pointer-events: none;
+  z-index: 20;
+  will-change: transform;
 }
 
 /* section rhythm: hairline above top-level sections */

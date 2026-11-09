@@ -49,6 +49,15 @@ final class Paper {
     var importStatusDetail: String?   // human-readable progress / error text
     var hasPDF: Bool
     var referencesStateRaw: String
+    // Reading position (optional with defaults → SwiftData lightweight migration of old stores).
+    /// data-b of the top-most visible block in the text view.
+    var readingBlock: Int? = nil
+    /// 0–1 progress through `readingBlock` (keeps the anchor across font-size changes).
+    var readingBlockFraction: Double? = nil
+    /// 0-based page index last shown in the PDF view.
+    var pdfPageIndex: Int? = nil
+    /// Last view mode the user chose for this paper: "text" | "pdf".
+    var lastViewModeRaw: String? = nil
 
     init(title: String, sourceURL: String? = nil) {
         self.id = UUID()

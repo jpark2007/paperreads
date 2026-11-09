@@ -11,6 +11,12 @@ struct NotesPanel: View {
     @Query private var highlights: [Highlight]
 
     @State private var saveTask: Task<Void, Never>?
+    /// Debounced mirror of notes + highlights to the Markdown file (see NotesFiles).
+    @State private var fileTask: Task<Void, Never>?
+    @State private var fileURL: URL?
+    @State private var fileError: String?
+    @State private var fileNotice: String?
+    @StateObject private var editor = MarkdownEditorController()
 
     init(paper: Paper, session: PaperSession) {
         self.paper = paper
@@ -41,10 +47,98 @@ struct NotesPanel: View {
         .onChange(of: paper.paperNotes) { scheduleSave() }
         // Highlight notes are edited in child rows; debounce-save them the same way.
         .onChange(of: highlights.map(\.note)) { scheduleSave() }
-        .onDisappear { saveNow() }
+        // Anything that changes the Markdown file (notes, highlights, title → rename, tags…).
+        .onChange(of: fileSnapshot) { scheduleFileWrite() }
+        .onAppear {
+            NotesFiles.register(context)
+            syncFile(allowPull: true)
+        }
+        .onDisappear {
+            saveNow()
+            flushFileAsync()
+        }
         // ⌘Q inside the debounce window: flush synchronously before the process exits.
         .onReceive(NotificationCenter.default.publisher(for: NSApplication.willTerminateNotification)) { _ in
             saveNow()
+            flushFileSync()
+        }
+        .onReceive(NotificationCenter.default.publisher(for: NotesFiles.folderDidChange)) { _ in
+            fileURL = nil
+            syncFile(allowPull: true)
+        }
+    }
+
+    // MARK: Notes file mirror
+
+    private var fileSnapshot: NotesFiles.Snapshot {
+        NotesFiles.snapshot(of: paper, highlights: highlights)
+    }
+
+    private func scheduleFileWrite() {
+        fileTask?.cancel()
+        fileTask = Task { @MainActor in
+            try? await Task.sleep(nanoseconds: 1_000_000_000)
+            guard !Task.isCancelled else { return }
+            fileTask = nil
+            syncFile(allowPull: true)
+        }
+    }
+
+    /// Reconcile with the file off the main actor; apply the outcome back here.
+    private func syncFile(allowPull: Bool, then: ((URL?) -> Void)? = nil) {
+        let snap = fileSnapshot
+        Task { @MainActor in
+            let outcome = await NotesFiles.sync(snap, allowPull: allowPull)
+            apply(outcome, requestedNotes: snap.notes)
+            then?(outcome.url)
+        }
+    }
+
+    private func flushFileAsync() {
+        guard fileTask != nil else { return }
+        fileTask?.cancel()
+        fileTask = nil
+        let snap = fileSnapshot
+        Task.detached(priority: .utility) { _ = await NotesFiles.sync(snap, allowPull: false) }
+    }
+
+    private func flushFileSync() {
+        fileTask?.cancel()
+        fileTask = nil
+        NotesFiles.flushSync(fileSnapshot)
+    }
+
+    private func apply(_ outcome: NotesFiles.Outcome, requestedNotes: String) {
+        switch outcome {
+        case .synced(let url), .deferred(let url):
+            fileURL = url
+            fileError = nil
+        case .pulled(let notes, let url):
+            fileURL = url
+            fileError = nil
+            // Only adopt the file's text if nothing was typed while we were reading it.
+            if paper.paperNotes == requestedNotes, paper.paperNotes != notes {
+                paper.paperNotes = notes
+                fileNotice = "Updated from \(url.lastPathComponent), edited outside Paperreads."
+            }
+        case .conflict(let url, let backup):
+            fileURL = url
+            fileError = nil
+            fileNotice = "The notes file was also edited elsewhere. That version was kept as “\(backup.lastPathComponent)”."
+        case .failed(let message):
+            fileError = message
+        }
+    }
+
+    private func openFile() {
+        syncFile(allowPull: true) { url in
+            if let url { NSWorkspace.shared.open(url) }
+        }
+    }
+
+    private func revealFile() {
+        syncFile(allowPull: true) { url in
+            if let url { NSWorkspace.shared.activateFileViewerSelecting([url]) }
         }
     }
 
@@ -74,24 +168,41 @@ struct NotesPanel: View {
 
     private var notesSection: some View {
         VStack(alignment: .leading, spacing: Theme.Space.s) {
-            Text("Paper notes").capsLabel()
+            HStack(alignment: .firstTextBaseline, spacing: Theme.Space.m) {
+                Text("Paper notes").capsLabel()
+                Spacer(minLength: 0)
+                Button("Open file", action: openFile)
+                    .buttonStyle(TextButtonStyle(size: 12))
+                    .help("Open this paper's Markdown notes file in your default editor")
+                Button("Reveal", action: revealFile)
+                    .buttonStyle(TextButtonStyle(size: 12))
+                    .help(fileURL.map { NotesFiles.displayPath($0) } ?? "Show the notes file in Finder")
+            }
+            MarkdownFormatBar(controller: editor)
             ZStack(alignment: .topLeading) {
+                MarkdownEditor(text: $paper.paperNotes, controller: editor)
                 if paper.paperNotes.isEmpty {
-                    Text("Your thoughts on this paper — questions, takeaways, what to read next.")
-                        .font(.serif(15))
+                    Text("Your thoughts on this paper — questions, takeaways, what to read next. Markdown works: # headings, - lists, **bold**.")
+                        .font(.rounded(14))
                         .foregroundStyle(Theme.faint)
-                        .padding(.top, 1)
+                        .padding(.top, 4)
+                        .fixedSize(horizontal: false, vertical: true)
                         .allowsHitTesting(false)
                 }
-                TextEditor(text: $paper.paperNotes)
-                    .font(.serif(15))
-                    .foregroundStyle(Theme.ink)
-                    .lineSpacing(4)
-                    .scrollContentBackground(.hidden)
-                    .background(Color.clear)
-                    .padding(.leading, -5)   // align NSTextView's inset with the labels
             }
-            .frame(minHeight: 160, maxHeight: 280)
+            .frame(height: 320)
+            if let fileError {
+                Text(fileError)
+                    .font(.rounded(12))
+                    .foregroundStyle(Theme.danger)
+                    .fixedSize(horizontal: false, vertical: true)
+                    .textSelection(.enabled)
+            } else if let fileNotice {
+                Text(fileNotice)
+                    .font(.rounded(12))
+                    .foregroundStyle(Theme.faint)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
             Hairline()
         }
     }
@@ -160,11 +271,16 @@ private struct HighlightRow: View {
                 .buttonStyle(.plain)
                 .help("Show in reader")
 
-                TextField("Add a note", text: $highlight.note, axis: .vertical)
-                    .textFieldStyle(.plain)
-                    .font(.rounded(13))
-                    .foregroundStyle(Theme.muted)
-                    .lineLimit(1...6)
+                // NSTextView-backed so "-", "--" and quotes are never auto-substituted.
+                ZStack(alignment: .topLeading) {
+                    PlainNoteField(text: $highlight.note, fontSize: 13, color: Theme.nsMuted)
+                    if highlight.note.isEmpty {
+                        Text("Add a note")
+                            .font(.rounded(13))
+                            .foregroundStyle(Theme.faint)
+                            .allowsHitTesting(false)
+                    }
+                }
 
                 HStack(spacing: Theme.Space.m) {
                     Text("¶\(highlight.blockIndex)")

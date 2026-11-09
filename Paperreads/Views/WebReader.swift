@@ -20,6 +20,123 @@ struct ReaderHighlightPayload: Equatable {
     }
 }
 
+/// A reading position in the clean-text view: the top-most visible block (`data-b`) and how far
+/// through that block the top of the viewport is (0–1), so it survives font-size changes.
+struct ReaderPosition: Equatable {
+    var block: Int
+    var fraction: Double
+
+    var jsObject: [String: Any] { ["b": block, "frac": fraction] }
+}
+
+// MARK: - Reader typography
+
+enum ReaderMeasure: String, CaseIterable {
+    case narrow, normal, wide
+    var label: String {
+        switch self { case .narrow: "Narrow"; case .normal: "Normal"; case .wide: "Wide" }
+    }
+}
+
+enum ReaderFontChoice: String, CaseIterable {
+    case serif, sans
+    var label: String {
+        switch self { case .serif: "Serif"; case .sans: "Sans" }
+    }
+}
+
+enum ReaderLineSpacing: String, CaseIterable {
+    case compact, normal, relaxed
+    var label: String {
+        switch self { case .compact: "Compact"; case .normal: "Normal"; case .relaxed: "Relaxed" }
+    }
+}
+
+/// The value sent to `Reader.setPrefs` / `Reader.load(prefs)`.
+struct ReaderTypography: Equatable {
+    var fontSize: Int
+    var measure: ReaderMeasure
+    var font: ReaderFontChoice
+    var lineHeight: ReaderLineSpacing
+
+    var jsObject: [String: Any] {
+        ["fontSize": fontSize, "measure": measure.rawValue, "font": font.rawValue, "lineHeight": lineHeight.rawValue]
+    }
+}
+
+/// Global reader typography preferences, persisted in UserDefaults (not secret, so not in
+/// config.json). Shared by the header popover, the View menu commands and the web reader.
+@MainActor
+final class ReaderPreferences: ObservableObject {
+    static let shared = ReaderPreferences()
+
+    static let fontSizeRange = 14...26
+    static let defaultFontSize = 19
+
+    private enum Key {
+        static let fontSize = "reader.fontSize"
+        static let measure = "reader.measure"
+        static let font = "reader.font"
+        static let lineHeight = "reader.lineHeight"
+    }
+
+    private let defaults: UserDefaults
+
+    @Published var fontSize: Int {
+        didSet {
+            let clamped = Self.clamp(fontSize)
+            if clamped != fontSize { fontSize = clamped }
+            defaults.set(fontSize, forKey: Key.fontSize)
+        }
+    }
+    @Published var measure: ReaderMeasure {
+        didSet { defaults.set(measure.rawValue, forKey: Key.measure) }
+    }
+    @Published var font: ReaderFontChoice {
+        didSet { defaults.set(font.rawValue, forKey: Key.font) }
+    }
+    @Published var lineHeight: ReaderLineSpacing {
+        didSet { defaults.set(lineHeight.rawValue, forKey: Key.lineHeight) }
+    }
+
+    init(defaults: UserDefaults = .standard) {
+        self.defaults = defaults
+        let storedSize = defaults.object(forKey: Key.fontSize) as? Int
+        fontSize = Self.clamp(storedSize ?? Self.defaultFontSize)
+        measure = defaults.string(forKey: Key.measure).flatMap(ReaderMeasure.init) ?? .normal
+        font = defaults.string(forKey: Key.font).flatMap(ReaderFontChoice.init) ?? .serif
+        lineHeight = defaults.string(forKey: Key.lineHeight).flatMap(ReaderLineSpacing.init) ?? .normal
+    }
+
+    var typography: ReaderTypography {
+        ReaderTypography(fontSize: fontSize, measure: measure, font: font, lineHeight: lineHeight)
+    }
+
+    var canIncrease: Bool { fontSize < Self.fontSizeRange.upperBound }
+    var canDecrease: Bool { fontSize > Self.fontSizeRange.lowerBound }
+    var isDefaultSize: Bool { fontSize == Self.defaultFontSize }
+    var isDefault: Bool {
+        isDefaultSize && measure == .normal && font == .serif && lineHeight == .normal
+    }
+
+    func increase() { if canIncrease { fontSize += 1 } }
+    func decrease() { if canDecrease { fontSize -= 1 } }
+    func actualSize() { if !isDefaultSize { fontSize = Self.defaultFontSize } }
+
+    func reset() {
+        actualSize()
+        if measure != .normal { measure = .normal }
+        if font != .serif { font = .serif }
+        if lineHeight != .normal { lineHeight = .normal }
+    }
+
+    private static func clamp(_ size: Int) -> Int {
+        min(max(size, fontSizeRange.lowerBound), fontSizeRange.upperBound)
+    }
+}
+
+// MARK: - Bridge
+
 /// Handle the rest of the app uses to drive the reader web view (scroll, flash, read selection).
 /// Owned by a `PaperSession`; the live `WebReader.Coordinator` attaches itself weakly.
 @MainActor
@@ -39,6 +156,12 @@ final class ReaderBridge {
     func currentSelection() async -> ReaderSelection? {
         guard let c = coordinator, c.isContentLoaded else { return nil }
         return await c.fetchSelection()
+    }
+
+    /// The reader's live position (`Reader.getPosition()`), or nil when no text is loaded.
+    func currentPosition() async -> ReaderPosition? {
+        guard let c = coordinator, c.isContentLoaded else { return nil }
+        return await c.fetchPosition()
     }
 
     func detach() {
@@ -67,8 +190,14 @@ struct WebReader: NSViewRepresentable {
     let contentToken: String
     let highlights: [ReaderHighlightPayload]
     let bridge: ReaderBridge
+    /// Typography applied on every load and whenever it changes.
+    var prefs: ReaderTypography
+    /// Read when content (re)loads: where to put the reader (latest unsaved position first).
+    var savedPosition: () -> ReaderPosition? = { nil }
     var onSelection: (SelectionAction, ReaderSelection) -> Void
     var onHighlightClicked: (UUID) -> Void
+    /// Validated, throttled position reports from the page (the receiver debounces saving).
+    var onPosition: (ReaderPosition) -> Void = { _ in }
     /// Called when the content process keeps crashing on this paper; reloading has stopped.
     var onContentCrashed: () -> Void = {}
 
@@ -105,6 +234,9 @@ struct WebReader: NSViewRepresentable {
         private(set) var isContentLoaded = false
         private var loadedKey: String?
         private var applied: [UUID: ReaderHighlightPayload] = [:]
+        private var appliedPrefs: ReaderTypography?
+        /// Highest data-b in the loaded content (-1 when there are no blocks).
+        private var maxBlock = -1
         private var chain: Task<Void, Never>?
         private var generation = 0
         private var crashGuard = WebCrashGuard()
@@ -141,6 +273,13 @@ struct WebReader: NSViewRepresentable {
                 load(key: key)
                 return
             }
+            if parent.prefs != appliedPrefs {
+                let prefs = parent.prefs
+                appliedPrefs = prefs
+                enqueue { webView in
+                    await WebBridge.call(webView, "return Reader.setPrefs(p);", ["p": prefs.jsObject])
+                }
+            }
             let desired = Dictionary(parent.highlights.map { ($0.id, $0) }, uniquingKeysWith: { a, _ in a })
             guard desired != applied else { return }
             let removed = applied.filter { desired[$0.key] != $0.value }.map(\.key)
@@ -162,9 +301,12 @@ struct WebReader: NSViewRepresentable {
             let gen = generation
             loadedKey = key
             isContentLoaded = false
+            maxBlock = -1
             let paperID = parent.paperID
             let highlights = parent.highlights
             applied = Dictionary(highlights.map { ($0.id, $0) }, uniquingKeysWith: { a, _ in a })
+            let prefs = parent.prefs
+            appliedPrefs = prefs
 
             enqueue { [weak self] webView in
                 let html = await Task.detached(priority: .userInitiated) {
@@ -172,9 +314,21 @@ struct WebReader: NSViewRepresentable {
                 }.value
                 guard let self, gen == self.generation else { return }
                 let content = html ?? "<p>This paper's text file is missing. Retry the import from the library.</p>"
-                let payload: [String: Any] = ["html": content, "highlights": highlights.map(\.jsObject)]
-                await WebBridge.call(webView, "await Reader.load(payload);", ["payload": payload])
+                var payload: [String: Any] = [
+                    "html": content,
+                    "highlights": highlights.map(\.jsObject),
+                    "prefs": prefs.jsObject,
+                ]
+                // Read the position now (not at enqueue time) so the latest unsaved one wins.
+                if html != nil, let position = self.parent.savedPosition() {
+                    payload["position"] = position.jsObject
+                }
+                let result = await WebBridge.call(webView, "return Reader.load(payload);", ["payload": payload])
                 guard gen == self.generation else { return }
+                if case .success(let value) = result, let dict = value as? [String: Any],
+                   let maxB = WebBridge.int(dict["maxBlock"], in: -1...10_000_000) {
+                    self.maxBlock = maxB
+                }
                 self.isContentLoaded = true
                 WebBridge.reveal(webView)
                 self.bridge?.contentDidLoad()
@@ -208,6 +362,15 @@ struct WebReader: NSViewRepresentable {
             return WebBridge.selection(value)
         }
 
+        func fetchPosition() async -> ReaderPosition? {
+            guard let webView, isContentLoaded else { return nil }
+            let gen = generation
+            let result = await WebBridge.call(webView, "return Reader.getPosition();")
+            guard gen == generation, isContentLoaded,
+                  case .success(let value) = result, let value, !(value is NSNull) else { return nil }
+            return WebBridge.readerPosition(value, maxBlock: maxBlock)
+        }
+
         // MARK: WKScriptMessageHandler
 
         func userContentController(_ userContentController: WKUserContentController,
@@ -225,6 +388,8 @@ struct WebReader: NSViewRepresentable {
                 isContentLoaded = false
                 loadedKey = nil
                 applied = [:]
+                appliedPrefs = nil
+                maxBlock = -1
                 sync()
             case "selection":
                 guard isContentLoaded,
@@ -232,6 +397,10 @@ struct WebReader: NSViewRepresentable {
                       let action = SelectionAction(rawValue: raw),
                       let selection = WebBridge.selection(body["selection"]) else { return }
                 parent.onSelection(action, selection)
+            case "position":
+                guard isContentLoaded,
+                      let position = WebBridge.readerPosition(body, maxBlock: maxBlock) else { return }
+                parent.onPosition(position)
             case "highlightClicked":
                 guard isContentLoaded,
                       let raw = WebBridge.string(body["id"], maxLength: 64),
@@ -255,6 +424,8 @@ struct WebReader: NSViewRepresentable {
             isContentLoaded = false
             loadedKey = nil
             applied = [:]
+            appliedPrefs = nil
+            maxBlock = -1
             reloadTask?.cancel()
             switch crashGuard.recordCrash(key: parent.paperID.uuidString) {
             case .giveUp:
