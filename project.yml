@@ -1,0 +1,35 @@
+name: Paperreads
+options:
+  bundleIdPrefix: com.jonahpark
+  deploymentTarget:
+    macOS: "14.0"
+  createIntermediateGroups: true
+settings:
+  base:
+    SWIFT_VERSION: "5.0"
+    MARKETING_VERSION: "0.1.0"
+    CURRENT_PROJECT_VERSION: "1"
+    GENERATE_INFOPLIST_FILE: YES
+    INFOPLIST_KEY_LSApplicationCategoryType: "public.app-category.education"
+    INFOPLIST_KEY_CFBundleDisplayName: "Paperreads"
+    # Ad-hoc signing: no keychain / signing-identity prompts. Do not change.
+    CODE_SIGN_IDENTITY: "-"
+    CODE_SIGN_STYLE: Manual
+    DEVELOPMENT_TEAM: ""
+    ENABLE_HARDENED_RUNTIME: NO
+    SWIFT_STRICT_CONCURRENCY: minimal
+targets:
+  Paperreads:
+    type: application
+    platform: macOS
+    sources:
+      - path: Paperreads
+        excludes:
+          - "Web/**"
+      - path: Paperreads/Web
+        type: folder
+        buildPhase: resources
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: com.jonahpark.Paperreads
+        PRODUCT_NAME: Paperreads
