@@ -46,11 +46,134 @@
     'm', 'eq', 'eqn', 'tex-fallback', 'cite', 'xref', 'tag', 'sc', 'theorem', 'proof',
     'runin', 'note', 'fnref', 'biblist', 'bibitem', 'listing', 'line', 'algo', 'flexfig',
     'panel', 'fig', 'tbl', 'tabular', 'c', 'l', 'r', 'rt', 'rb', 'tagged', 'ack', 'abstract',
-    'pre-wrap',
+    'pre-wrap', 'box', 'box-title', 'diagram',
   ]);
 
   const MAX_DEPTH = 160;
-  const DATA_IMG_RE = /^data:image\/(png|jpe?g|gif|webp|avif|bmp|svg\+xml)[;,]/i;
+  const DATA_IMG_RE = /^data:image\/(png|jpe?g|gif|webp|avif|bmp)[;,]/i;
+
+  // ---------------------------------------------------------------------------
+  // SVG pictures as images
+  //
+  // LaTeXML draws TikZ / pgfplots pictures as inline <svg>. Ingest turns them into
+  // <img src="data:image/svg+xml;base64,…"> built from a SANITIZED copy (buildSafeSVG). An SVG
+  // loaded as an image can never run script or fetch anything, but the sanitizer still only
+  // accepts SVG data URLs whose decoded document passes the same allowlist (isSafeSVGDataURL),
+  // so the reader's defence-in-depth re-sanitize rejects anything else.
+  // ---------------------------------------------------------------------------
+
+  const SVG_NS = 'http://www.w3.org/2000/svg';
+  const XLINK_NS = 'http://www.w3.org/1999/xlink';
+  const SVG_TAGS = new Set([
+    'svg', 'g', 'path', 'rect', 'circle', 'ellipse', 'line', 'polyline', 'polygon', 'text',
+    'tspan', 'defs', 'clippath', 'mask', 'lineargradient', 'radialgradient', 'stop', 'marker',
+    'pattern', 'symbol', 'use', 'title', 'desc',
+  ]);
+  const SVG_MAX_BYTES = 4 * 1024 * 1024;
+  const SVG_EXTERNAL_URL_RE = /url\(\s*['"]?\s*(?!#)/i;
+
+  function svgAttrOK(name, value) {
+    const n = String(name).toLowerCase();
+    const v = String(value);
+    if (!/^[a-z][a-z0-9:_.-]*$/.test(n)) return false;
+    if (n.startsWith('on')) return false;
+    if (n === 'href' || n === 'xlink:href') return /^#[\w.:-]{1,256}$/.test(v.trim());
+    if (n === 'xml:base' || n === 'xmlns' || n.startsWith('xmlns:')) return false;
+    if (v.length > 200000) return false;
+    if (SVG_EXTERNAL_URL_RE.test(v)) return false;
+    if (/javascript:|data:|@import|expression\s*\(|-moz-binding|behavior\s*:/i.test(v)) return false;
+    return true;
+  }
+
+  function copySvgAttrs(src, dst) {
+    for (let i = 0; i < src.attributes.length; i++) {
+      const a = src.attributes[i];
+      if (!svgAttrOK(a.name, a.value)) continue;
+      if (a.name.toLowerCase() === 'xlink:href') dst.setAttributeNS(XLINK_NS, 'xlink:href', a.value.trim());
+      else dst.setAttribute(a.name, a.value);
+    }
+  }
+
+  /**
+   * Rebuilds `src` (an <svg> element, e.g. from an HTML-parsed page) into a fresh XML
+   * document keeping only SVG_TAGS and safe attributes. <a> is unwrapped; every other element
+   * (script, style, foreignObject, image, animate, filters …) is dropped with its subtree.
+   * `onForeignObject(fo, xdoc)` may return a replacement SVG node for each foreignObject.
+   */
+  function buildSafeSVG(src, onForeignObject) {
+    const xdoc = document.implementation.createDocument(SVG_NS, 'svg', null);
+    const out = xdoc.documentElement;
+    copySvgAttrs(src, out);
+    (function walk(s, d, depth) {
+      for (let n = s.firstChild; n; n = n.nextSibling) {
+        if (n.nodeType === 3) { d.appendChild(xdoc.createTextNode(n.data)); continue; }
+        if (n.nodeType !== 1 || depth > 200) continue;
+        const tag = String(n.localName || '').toLowerCase();
+        if (tag === 'foreignobject') {
+          const r = onForeignObject ? onForeignObject(n, xdoc) : null;
+          if (r) d.appendChild(r);
+          continue;
+        }
+        if (n.namespaceURI !== SVG_NS) continue;
+        if (tag === 'a') { walk(n, d, depth + 1); continue; }
+        if (!SVG_TAGS.has(tag) || tag === 'svg' && depth > 0) continue;
+        const el = xdoc.createElementNS(SVG_NS, n.localName);
+        copySvgAttrs(n, el);
+        walk(n, el, depth + 1);
+        d.appendChild(el);
+      }
+    })(src, out, 0);
+    return out;
+  }
+
+  function base64UTF8(str) {
+    const bytes = new TextEncoder().encode(str);
+    let bin = '';
+    for (let i = 0; i < bytes.length; i += 0x8000) {
+      bin += String.fromCharCode.apply(null, bytes.subarray(i, i + 0x8000));
+    }
+    return btoa(bin);
+  }
+
+  /** data: URL for an element produced by buildSafeSVG, or null when too large. */
+  function svgDataURL(svgEl) {
+    const xml = new XMLSerializer().serializeToString(svgEl);
+    if (xml.length > SVG_MAX_BYTES) return null;
+    const url = 'data:image/svg+xml;base64,' + base64UTF8(xml);
+    return url.length <= 8 * 1024 * 1024 ? url : null;
+  }
+
+  /** True when `v` is a base64 SVG data URL whose document passes the SVG allowlist. */
+  function isSafeSVGDataURL(v) {
+    const m = /^data:image\/svg\+xml;base64,([A-Za-z0-9+/=]+)$/.exec(v);
+    if (!m || m[1].length > SVG_MAX_BYTES * 4 / 3 + 4) return false;
+    let xml;
+    try {
+      const bin = atob(m[1]);
+      const bytes = new Uint8Array(bin.length);
+      for (let i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i);
+      xml = new TextDecoder('utf-8', { fatal: true }).decode(bytes);
+    } catch (_) { return false; }
+    if (/<!DOCTYPE|<!ENTITY|<\?xml-stylesheet/i.test(xml)) return false;
+    const d = new DOMParser().parseFromString(xml, 'image/svg+xml');
+    const root = d.documentElement;
+    if (!root || root.namespaceURI !== SVG_NS || root.localName !== 'svg') return false;
+    if (d.getElementsByTagName('parsererror').length) return false;
+    const tw = d.createTreeWalker(d, 0xFFFFFFFF);
+    for (let n = tw.nextNode(); n; n = tw.nextNode()) {
+      if (n.nodeType === 3 || n.nodeType === 8) continue; // text, comment
+      if (n.nodeType !== 1) return false; // processing instructions, CDATA …
+      const tag = String(n.localName).toLowerCase();
+      if (n.namespaceURI !== SVG_NS || !SVG_TAGS.has(tag)) return false;
+      for (let i = 0; i < n.attributes.length; i++) {
+        const a = n.attributes[i];
+        if (a.name === 'xmlns') { if (a.value !== SVG_NS) return false; continue; }
+        if (a.name === 'xmlns:xlink') { if (a.value !== XLINK_NS) return false; continue; }
+        if (!svgAttrOK(a.name, a.value)) return false;
+      }
+    }
+    return true;
+  }
 
   function safeHref(value, opts) {
     const v = String(value || '').trim();
@@ -66,6 +189,7 @@
   function safeImgSrc(value, opts) {
     const v = String(value || '').trim();
     if (!v) return null;
+    if (/^data:image\/svg\+xml/i.test(v)) return v.length <= 8 * 1024 * 1024 && isSafeSVGDataURL(v) ? v : null;
     if (/^data:/i.test(v)) return DATA_IMG_RE.test(v) && v.length <= 8 * 1024 * 1024 ? v : null;
     let u;
     try { u = opts && opts.baseURL ? new URL(v, opts.baseURL) : new URL(v); } catch (_) { return null; }
@@ -465,24 +589,57 @@
   function katexHTML(tex, display) {
     const key = (display ? 'D' : 'I') + tex;
     if (renderCache.has(key)) return renderCache.get(key);
-    let html = null;
-    try {
-      html = global.katex.renderToString(tex, {
-        displayMode: display,
-        throwOnError: true,
-        strict: 'ignore',
-        trust: false,
-        output: 'htmlAndMathml',
-        maxExpand: 1000,
-        maxSize: 40,
-        macros: Object.assign({}, KATEX_MACROS),
-      });
-    } catch (_) {
-      html = null;
+    let html = katexTry(tex, display);
+    if (html === null) {
+      // LaTeXML-isms KaTeX rejects: array/tabular position argument (often empty "[]").
+      const fixed = tex.replace(/\\begin\{(array|tabular|aligned|split)\}\s*\[[^\]]*\]/g, '\\begin{$1}');
+      html = katexTry(fixed, display);
+      // Author macros LaTeXML left unexpanded in the alttext (e.g. \E for expectation):
+      // draw each undefined letters-only macro as an upright operator name rather than
+      // falling back to raw TeX.
+      const extra = {};
+      for (let i = 0; html === null && i < 6; i++) {
+        const name = undefinedMacro(fixed, display, extra);
+        if (!name || extra[name]) break;
+        extra[name] = '\\operatorname{' + name.slice(1) + '}';
+        html = katexTry(fixed, display, extra);
+      }
     }
     if (renderCache.size >= RENDER_CACHE_MAX) renderCache.delete(renderCache.keys().next().value);
     renderCache.set(key, html);
     return html;
+  }
+
+  function katexOptions(display, extra) {
+    return {
+      displayMode: display,
+      throwOnError: true,
+      strict: 'ignore',
+      trust: false,
+      output: 'htmlAndMathml',
+      maxExpand: 1000,
+      maxSize: 40,
+      macros: Object.assign({}, KATEX_MACROS, extra || {}),
+    };
+  }
+
+  /** The letters-only control sequence KaTeX reports as undefined in `tex`, if any. */
+  function undefinedMacro(tex, display, extra) {
+    try {
+      global.katex.renderToString(tex, katexOptions(display, extra));
+    } catch (e) {
+      const m = /Undefined control sequence: (\\[A-Za-z]+)/.exec(String(e && e.message));
+      return m ? m[1] : null;
+    }
+    return null;
+  }
+
+  function katexTry(tex, display, extra) {
+    try {
+      return global.katex.renderToString(tex, katexOptions(display, extra));
+    } catch (_) {
+      return null;
+    }
   }
 
   /** Renders one `.m` span in place. Idempotent. */
@@ -695,6 +852,9 @@
     sanitizeHTML: sanitizeHTML,
     safeHref: safeHref,
     safeImgSrc: safeImgSrc,
+    buildSafeSVG: buildSafeSVG,
+    svgDataURL: svgDataURL,
+    isSafeSVGDataURL: isSafeSVGDataURL,
     inertDocument: inertDocument,
     protectMath: protectMath,
     restoreMath: restoreMath,

@@ -1,4 +1,5 @@
 import Foundation
+import AppKit
 import PDFKit
 import SwiftData
 import CryptoKit
@@ -24,6 +25,10 @@ enum ImportError: LocalizedError {
     case emptyConversion
     case paperRemoved
     case conversionTooLong
+    /// Neither Claude nor local extraction produced text (associated: why Claude didn't).
+    case noExtractableText(String?)
+    /// Internal: the paper was a duplicate and was folded into the existing one.
+    case merged
 
     var errorDescription: String? {
         switch self {
@@ -49,6 +54,12 @@ enum ImportError: LocalizedError {
             return "The paper was removed."
         case .conversionTooLong:
             return "The paper is too long to convert in one pass, and Claude stopped before reaching any text."
+        case .noExtractableText(let reason):
+            let base = "This PDF has no extractable text (it may be a scanned image)."
+            guard let reason, !reason.isEmpty else { return base }
+            return reason + " " + base
+        case .merged:
+            return "This paper is already in your library."
         }
     }
 }
@@ -109,10 +120,44 @@ enum ArxivID {
     }
 
     /// The first "arXiv:XXXX.XXXXX(vN)" anywhere in the text. May be a cited preprint, so the
-    /// caller must confirm it (see Importer.detectArxivID / pipeline).
+    /// caller must confirm it (see PDFIdentityResolver).
     static func findInText(_ text: String) -> String? {
         find(text, patterns: [#"arXiv:(\d{4}\.\d{4,5})(v\d+)?"#,
                               #"arXiv:([a-z]+(?:-[a-z]+)?(?:\.[A-Z]{2})?/\d{7})(v\d+)?"#])
+    }
+
+    /// Every "arXiv:XXXX.XXXXX(vN)" / "arXiv:archive/NNNNNNN" in the text, in order, deduplicated
+    /// by base id (the first spelling wins).
+    static func findAllInText(_ text: String) -> [String] {
+        var out: [String] = []
+        let patterns = [#"arXiv\s*:\s*(\d{4}\.\d{4,5})(v\d+)?"#,
+                        #"arXiv\s*:\s*([a-z]+(?:-[a-z]+)?(?:\.[A-Z]{2})?/\d{7})(v\d+)?"#,
+                        #"arxiv\.org/(?:abs|pdf)/(\d{4}\.\d{4,5})(v\d+)?"#]
+        var hits: [(Int, String)] = []
+        let range = NSRange(text.startIndex..., in: text)
+        for p in patterns {
+            guard let re = try? NSRegularExpression(pattern: p, options: [.caseInsensitive]) else { continue }
+            for m in re.matches(in: text, range: range) {
+                guard let idR = Range(m.range(at: 1), in: text) else { continue }
+                var id = String(text[idR])
+                if m.range(at: 2).location != NSNotFound, let vR = Range(m.range(at: 2), in: text) { id += text[vR] }
+                if !isValid(id) { id = stripVersion(id) }
+                if isValid(id) { hits.append((m.range.location, id)) }
+            }
+        }
+        for (_, id) in hits.sorted(by: { $0.0 < $1.0 })
+        where !out.contains(where: { stripVersion($0) == stripVersion(id) }) {
+            out.append(id)
+        }
+        return out
+    }
+
+    /// arXiv's DataCite DOI "10.48550/arXiv.2401.12345" → "2401.12345".
+    static func fromArxivDOI(_ doi: String) -> String? {
+        let lower = doi.lowercased()
+        guard lower.hasPrefix("10.48550/arxiv.") else { return nil }
+        let id = String(doi.dropFirst("10.48550/arxiv.".count))
+        return isValid(id) ? id : nil
     }
 
     private static func find(_ text: String, patterns: [String]) -> String? {
@@ -232,6 +277,16 @@ final class Importer: ObservableObject {
     /// Papers whose title is only the dropped file's name; replaced by real metadata or by
     /// the title found in the converted text.
     private var provisionalTitles: Set<UUID> = []
+    /// Papers being reprocessed: identity is re-checked and saved conversions are not reused.
+    private var reprocessing: Set<UUID> = []
+
+    /// Called when an import turned out to be a paper already in the library (or when a
+    /// redundant failed copy is removed): `from` is about to be deleted, `to` is the paper to
+    /// show instead; `message` is a short notice for the user (nil for silent clean-up).
+    var onRedirect: ((_ from: UUID, _ to: UUID, _ message: String?) -> Void)?
+
+    /// Status detail of a paper whose text came from local PDF extraction (no Claude).
+    static let localExtractionDetail = "Plain-text extraction (equations may be garbled). Reprocess to try Claude again."
 
     private static let placeholderPrefix = "Importing "
     nonisolated private static let maxLocalPDFBytes = HTTP.maxPDFBytes
@@ -275,7 +330,9 @@ final class Importer: ObservableObject {
     }
 
     /// Copies the PDF into the store, creates Paper, runs pipeline. The copy (up to 60 MB,
-    /// possibly from a slow volume) runs off the main actor; the Paper is returned at once.
+    /// possibly from a slow volume) and its SHA-256 run off the main actor; the Paper is
+    /// returned at once. If the same PDF (by hash) is already in the library, the new Paper is
+    /// removed again and `onRedirect` moves the selection to the existing one.
     func importPDF(at url: URL, context: ModelContext) -> Paper {
         let name = url.deletingPathExtension().lastPathComponent
         let paper = Paper(title: name.isEmpty ? "Untitled PDF" : name, sourceURL: nil)
@@ -290,23 +347,35 @@ final class Importer: ObservableObject {
         let dst = PaperStore.pdfURL(id)
         Task { @MainActor [weak self] in
             let result: Result<Void, Error> = await Task.detached(priority: .userInitiated) {
-                Result { try Importer.copyPDF(from: url, to: dst) }
+                Result {
+                    try Importer.copyPDF(from: url, to: dst)
+                    if let digest = PaperStore.sha256(of: dst) {
+                        PaperStore.recordPDFHash(id, sha256: digest.hash, size: digest.size)
+                    }
+                }
             }.value
             guard let self else { return }
-            self.activeIds.remove(id)
             guard let p = self.paper(id, context) else {
+                self.activeIds.remove(id)
                 self.cleanupOrphanDirectory(id, context)
                 return
             }
             switch result {
             case .success:
                 p.hasPDF = true
+                p.importStatusDetail = "Checking library…"
+                self.save(context)
+                // Same PDF already in the library → select that paper instead.
+                let merged = (try? await self.resolveDuplicates(id, context)) ?? false
+                self.activeIds.remove(id)
+                guard !merged, let p = self.paper(id, context) else { return }
                 p.importStatusDetail = "Waiting…"
                 self.save(context)
                 self.enqueue(Job(id: id, context: context))
             case .failure(let error):
+                self.activeIds.remove(id)
                 p.importState = .failed
-                p.importStatusDetail = error.localizedDescription
+                p.importStatusDetail = Self.message(for: error)
                 self.save(context)
             }
         }
@@ -330,14 +399,44 @@ final class Importer: ObservableObject {
             save(context)
             return
         }
+        markTitleProvisionalIfUnidentified(paper)
         paper.importState = .queued
         paper.importStatusDetail = "Waiting…"
         save(context)
         enqueue(Job(id: id, context: context))
     }
 
+    /// Whether "Reprocess" can run for this paper now.
+    func canReprocess(_ paper: Paper) -> Bool {
+        !activeIds.contains(paper.id) && (paper.hasPDF || paper.arxivId != nil || paper.doi != nil)
+    }
+
+    /// Reruns the whole pipeline for a ready or failed paper: identity is resolved again
+    /// (a PDF's own arXiv stamp/metadata wins over a stored id), the clean text is rebuilt and
+    /// a PDF conversion is done afresh (a saved conversion is not reused). Notes, highlights,
+    /// tags, status and chats are kept; highlights re-anchor by their quote if blocks moved.
+    func reprocess(_ paper: Paper, context: ModelContext) {
+        guard canReprocess(paper) else { return }
+        let id = paper.id
+        refQueue.removeAll { $0.id == id }
+        if refCurrent?.id == id { refCurrent?.task.cancel() }
+        markTitleProvisionalIfUnidentified(paper)
+        reprocessing.insert(id)
+        paper.importState = .queued
+        paper.importStatusDetail = "Waiting…"
+        save(context)
+        enqueue(Job(id: id, context: context))
+    }
+
+    /// A paper with no identifier still carries its file name as title: let the pipeline
+    /// replace it (the in-memory provisional set does not survive relaunch).
+    private func markTitleProvisionalIfUnidentified(_ p: Paper) {
+        if p.arxivId == nil, p.doi == nil, p.s2PaperId == nil { provisionalTitles.insert(p.id) }
+    }
+
     /// Stops any queued or running work for a paper (call before deleting it).
     func cancel(_ paperId: UUID) {
+        reprocessing.remove(paperId)
         queue.removeAll { $0.id == paperId }
         refQueue.removeAll { $0.id == paperId }
         if current?.id == paperId { current?.task.cancel() }
@@ -433,9 +532,13 @@ final class Importer: ObservableObject {
 
     private func run(_ job: Job) async {
         let ctx = job.context
+        defer { reprocessing.remove(job.id) }
         do {
             try await pipeline(job.id, ctx)
             if paper(job.id, ctx) != nil { enqueueReferences(job) }
+        } catch ImportError.merged {
+            // The paper was a duplicate and has been removed in favour of the existing one.
+            return
         } catch {
             guard let p = paper(job.id, ctx) else {
                 cleanupOrphanDirectory(job.id, ctx)
@@ -455,6 +558,9 @@ final class Importer: ObservableObject {
         var p = try require(id, ctx)
         var arxivId = p.arxivId
         var meta: S2Paper?
+        var arxivEntry: ArxivEntry?
+        var hints: PDFIdentityHints?
+        let isReprocess = reprocessing.contains(id)
 
         // 1. Resolve.
         if arxivId == nil, let doi = p.doi {
@@ -462,11 +568,20 @@ final class Importer: ObservableObject {
             do {
                 meta = try await ScholarAPI.paper(ScholarAPI.doiID(doi))
             } catch ScholarError.notFound {
-                throw ImportError.noOpenAccessPDF
+                if !p.hasPDF { throw ImportError.noOpenAccessPDF }
+            } catch is CancellationError {
+                throw CancellationError()
+            } catch {
+                // Without a local PDF there is nothing else to go on.
+                if try require(id, ctx).hasPDF == false { throw error }
             }
             p = try require(id, ctx)
             if let m = meta { apply(m, to: p) }
             if let ax = meta?.externalIds?.arXiv?.trimmingCharacters(in: .whitespaces), ArxivID.isValid(ax) {
+                arxivId = ax
+                p.arxivId = ax
+                save(ctx)
+            } else if let ax = ArxivID.fromArxivDOI(doi) {
                 arxivId = ax
                 p.arxivId = ax
                 save(ctx)
@@ -476,51 +591,110 @@ final class Importer: ObservableObject {
                 let data = try await downloadPDF(pdfURL)
                 try await writePDF(data, id, ctx)
             }
+            if try await resolveDuplicates(id, ctx) { throw ImportError.merged }
         } else if arxivId == nil, p.hasPDF {
+            // A dropped PDF: identify it before paying for a conversion.
+            let found = try await identifyPDF(id, ctx)
+            hints = found.hints
+            p = try require(id, ctx)
+            if let r = found.resolution {
+                if let m = r.s2 { apply(m, to: p); meta = m }
+                if r.s2?.cleanTitle == nil, let e = r.arxiv { apply(e, to: p) }
+                arxivEntry = r.arxiv
+                if p.doi == nil, let d = r.doi.flatMap(DOIParser.normalize) { p.doi = d }
+                if let ax = r.arxivId {
+                    arxivId = ax
+                    p.arxivId = ax
+                    p.sourceURL = "https://arxiv.org/abs/\(ax)"
+                }
+            }
+            if let h = hints { applyPDFHints(h, to: p) }
+            save(ctx)
+            if try await resolveDuplicates(id, ctx) { throw ImportError.merged }
+        } else if isReprocess, arxivId != nil, p.hasPDF {
+            // Re-check a stored id against the PDF's own trusted arXiv id (metadata / stamp).
             try update(id, ctx, .fetching, "Reading PDF…")
             let localPDF = PaperStore.pdfURL(id)
-            let detected = await Task.detached(priority: .userInitiated) {
-                Importer.detectArxivID(in: localPDF)
+            let h = await Task.detached(priority: .userInitiated) {
+                PDFIdentity.hints(for: localPDF, fileStem: nil)
             }.value
-            var found: String?
-            if let stamp = detected.stamp {
-                found = stamp
-            } else if let candidate = detected.candidate {
-                // An "arXiv:" mention without the margin stamp may be a cited preprint: only
-                // take it when that preprint's title appears on the PDF's first page.
-                try update(id, ctx, .fetching, "Checking arXiv id…")
-                if let m = try? await ScholarAPI.paper(ScholarAPI.arxivID(candidate)),
-                   let t = m.cleanTitle, Self.text(detected.firstPage, containsTitle: t) {
-                    found = candidate
-                    meta = m
-                }
-                try Task.checkCancellation()
-            }
-            p = try require(id, ctx)
-            if let found {
-                arxivId = found
-                p.arxivId = found
-                p.sourceURL = "https://arxiv.org/abs/\(found)"
-                if let m = meta { apply(m, to: p) }
+            hints = h
+            if let stamp = h.stampArxiv, let current = arxivId,
+               ArxivID.stripVersion(stamp) != ArxivID.stripVersion(current) {
+                p = try require(id, ctx)
+                arxivId = stamp
+                p.arxivId = stamp
+                p.sourceURL = "https://arxiv.org/abs/\(stamp)"
                 save(ctx)
+                if try await resolveDuplicates(id, ctx) { throw ImportError.merged }
             }
         }
 
         if let arxivId {
-            try await arxivPath(id, arxivId, meta, ctx)
+            try await arxivPath(id, arxivId, meta, arxivEntry, hints, ctx)
         } else {
-            try await pdfPath(id, ctx)
+            try await pdfPath(id, ctx, hints: hints)
+        }
+    }
+
+    /// Reads the PDF's identity hints off the main actor and resolves them over the network.
+    private func identifyPDF(_ id: UUID, _ ctx: ModelContext) async throws
+        -> (hints: PDFIdentityHints, resolution: PDFIdentityResolution?) {
+        try update(id, ctx, .fetching, "Reading PDF…")
+        let localPDF = PaperStore.pdfURL(id)
+        let stem = provisionalTitles.contains(id) ? try require(id, ctx).title : nil
+        let hints = await Task.detached(priority: .userInitiated) {
+            PDFIdentity.hints(for: localPDF, fileStem: stem)
+        }.value
+        try Task.checkCancellation()
+        guard hints.readable else { throw ImportError.unreadableFile }
+        try update(id, ctx, .fetching, "Identifying paper…")
+        let resolution = try await PDFIdentityResolver.resolve(hints) { [weak self] detail in
+            await MainActor.run {
+                guard let self, let p = self.paper(id, ctx), p.importState == .fetching else { return }
+                p.importStatusDetail = detail
+                self.save(ctx)
+            }
+        }
+        try Task.checkCancellation()
+        return (hints, resolution)
+    }
+
+    /// Title/authors from the PDF itself, for papers no metadata service recognised. Replaces
+    /// only a provisional (file-name) title.
+    private func applyPDFHints(_ h: PDFIdentityHints, to p: Paper) {
+        if provisionalTitles.contains(p.id) || isPlaceholderTitle(p), let t = h.titleGuess {
+            p.title = Self.clean(t, max: 500)
+            provisionalTitles.remove(p.id)
+        }
+        if p.authors.isEmpty, !h.metadataAuthors.isEmpty {
+            p.authors = h.metadataAuthors.prefix(200).map { Self.clean($0, max: 200) }
         }
     }
 
     // 2. arXiv path.
-    private func arxivPath(_ id: UUID, _ arxivId: String, _ known: S2Paper?, _ ctx: ModelContext) async throws {
+    private func arxivPath(_ id: UUID, _ arxivId: String, _ known: S2Paper?, _ knownEntry: ArxivEntry?,
+                           _ hints: PDFIdentityHints?, _ ctx: ModelContext) async throws {
         var meta = known
         if meta == nil {
             try update(id, ctx, .fetching, "Fetching metadata…")
             meta = try? await ScholarAPI.paper(ScholarAPI.arxivID(arxivId))
             try Task.checkCancellation()
-            if let m = meta { apply(m, to: try require(id, ctx)); save(ctx) }
+            if let m = meta {
+                apply(m, to: try require(id, ctx))
+                save(ctx)
+            } else {
+                // Semantic Scholar unavailable (rate limit, not indexed yet): use arXiv's own
+                // metadata so the title is never the file name.
+                var entry = knownEntry
+                if entry == nil { entry = try? await ArxivAPI.entry(id: arxivId) }
+                try Task.checkCancellation()
+                if let e = entry {
+                    apply(e, to: try require(id, ctx))
+                    save(ctx)
+                }
+            }
+            if try await resolveDuplicates(id, ctx) { throw ImportError.merged }
         }
 
         try update(id, ctx, .fetching, "Fetching arXiv text…")
@@ -540,7 +714,7 @@ final class Importer: ObservableObject {
             if let result {
                 try await finish(id, ctx, result, kind: .arxivHTML)
 
-                // Keep a copy of the PDF for the PDF view (non-fatal).
+                // Keep a copy of the PDF for the PDF view (non-fatal). A dropped PDF is kept.
                 if let p = paper(id, ctx), !p.hasPDF {
                     if let url = URL(string: "https://arxiv.org/pdf/\(arxivId)"),
                        let data = try? await downloadPDF(url) {
@@ -559,7 +733,7 @@ final class Importer: ObservableObject {
             let data = try await downloadPDF(url)
             try await writePDF(data, id, ctx)
         }
-        try await pdfPath(id, ctx)
+        try await pdfPath(id, ctx, hints: hints)
     }
 
     /// arxiv.org/html first, then ar5iv. Valid only if the page is LaTeXML output.
@@ -591,52 +765,124 @@ final class Importer: ObservableObject {
         return nil
     }
 
-    // 3. PDF path.
-    private func pdfPath(_ id: UUID, _ ctx: ModelContext) async throws {
+    // 3. PDF path: Claude conversion, else local extraction.
+    private func pdfPath(_ id: UUID, _ ctx: ModelContext, hints: PDFIdentityHints?) async throws {
         let p = try require(id, ctx)
         guard p.hasPDF else { throw ImportError.missingPDF }
-        guard AppSettings.shared.effectiveAPIKey != nil else { throw ImportError.missingAPIKey }
 
         try update(id, ctx, .converting, "Checking PDF…")
         let pdfFile = PaperStore.pdfURL(id)
         let maxBytes = Self.maxConvertPDFBytes
         let maxPages = Self.maxConvertPages
-        let (data, pageCount, pdfHash): (Data, Int, String) = try await Task.detached(priority: .userInitiated) {
+        // Validate and hash the file; the bytes are only loaded when Claude can take them.
+        let (data, size, pageCount, pdfHash): (Data?, Int, Int, String) = try await Task.detached(priority: .userInitiated) {
             let attrs = try? FileManager.default.attributesOfItem(atPath: pdfFile.path)
             let size = (attrs?[.size] as? NSNumber)?.intValue ?? 0
             guard size > 0 else { throw ImportError.missingPDF }
-            guard size <= maxBytes else { throw ImportError.fileTooLarge(maxBytes) }
-            let d = try Data(contentsOf: pdfFile)
-            guard Importer.looksLikePDF(d) else { throw ImportError.notAPDF }
-            guard let doc = PDFDocument(data: d) else { throw ImportError.unreadableFile }
-            if doc.pageCount > maxPages { throw ImportError.pdfTooLong(doc.pageCount) }
-            let hash = SHA256.hash(data: d).map { String(format: "%02x", $0) }.joined()
-            return (d, doc.pageCount, hash)
+            guard let handle = try? FileHandle(forReadingFrom: pdfFile) else { throw ImportError.unreadableFile }
+            let head = (try? handle.read(upToCount: 1024)) ?? Data()
+            try? handle.close()
+            guard Importer.looksLikePDF(head) else { throw ImportError.notAPDF }
+            guard let doc = PDFDocument(url: pdfFile) else { throw ImportError.unreadableFile }
+            let d: Data? = size <= maxBytes && doc.pageCount <= maxPages ? try Data(contentsOf: pdfFile) : nil
+            let hash = d.map { SHA256.hash(data: $0).map { String(format: "%02x", $0) }.joined() }
+                ?? PaperStore.sha256(of: pdfFile)?.hash ?? ""
+            return (d, size, doc.pageCount, hash)
         }.value
 
         // A conversion already paid for this exact PDF (e.g. a later step failed, or the app quit
-        // while preparing text) is reused instead of converting again.
-        let pdfSize = data.count
-        let saved: (markdown: String, isComplete: Bool)? = await Task.detached(priority: .userInitiated) {
-            PaperStore.readSavedConversion(id, pdfSize: pdfSize, pdfSHA256: pdfHash)
-        }.value
+        // while preparing text) is reused instead of converting again — except on Reprocess.
+        let fresh = reprocessing.contains(id)
+        var saved: (markdown: String, isComplete: Bool)?
+        if !pdfHash.isEmpty {
+            saved = await Task.detached(priority: .userInitiated) {
+                PaperStore.readSavedConversion(id, pdfSize: size, pdfSHA256: pdfHash)
+            }.value
+        }
         try Task.checkCancellation()
-        let md: String
-        let isComplete: Bool
-        if let saved {
-            md = saved.markdown
-            isComplete = saved.isComplete
-        } else {
-            (md, isComplete) = try await convert(id, ctx, data: data, pageCount: pageCount, pdfHash: pdfHash)
+
+        var converted: (markdown: String, isComplete: Bool)? = fresh ? nil : saved
+        var claudeProblem: String?
+        if converted == nil {
+            if AppSettings.shared.effectiveAPIKey == nil {
+                claudeProblem = "No Anthropic API key is set, so Claude could not convert the PDF."
+            } else if size > maxBytes {
+                claudeProblem = "The PDF is larger than \(HTTP.formatBytes(maxBytes)), the most Claude can take."
+            } else if pageCount > maxPages {
+                claudeProblem = "The PDF has \(pageCount) pages; Claude converts at most \(maxPages)."
+            } else if let data {
+                do {
+                    converted = try await convert(id, ctx, data: data, pageCount: pageCount, pdfHash: pdfHash)
+                } catch is CancellationError {
+                    throw CancellationError()
+                } catch ImportError.paperRemoved {
+                    throw ImportError.paperRemoved
+                } catch {
+                    try Task.checkCancellation()
+                    claudeProblem = Self.conversionProblem(error)
+                }
+            }
         }
 
+        // Reprocess asked Claude again and it failed: keep the earlier Claude conversion rather
+        // than dropping to plain-text extraction.
+        if converted == nil, fresh, let saved { converted = saved }
+
+        if let converted {
+            try update(id, ctx, .converting, "Preparing clean text…")
+            let result = try await WebProcessor.shared.ingestMarkdown(converted.markdown)
+            try await finish(id, ctx, result, kind: .claudeMarkdown)
+            if !converted.isComplete, let p = paper(id, ctx) {
+                p.importStatusDetail = "Text incomplete — the PDF was too long to convert in one pass."
+                save(ctx)
+            }
+            return
+        }
+        try await localExtraction(id, ctx, hints: hints, problem: claudeProblem)
+    }
+
+    /// Offline fallback: PDFKit text → simple Markdown → the normal Markdown ingest.
+    private func localExtraction(_ id: UUID, _ ctx: ModelContext, hints: PDFIdentityHints?,
+                                 problem: String?) async throws {
+        try update(id, ctx, .converting, "Extracting text from the PDF…")
+        let p = try require(id, ctx)
+        let knownTitle = provisionalTitles.contains(id) || isPlaceholderTitle(p) ? hints?.titleGuess : p.title
+        var note = "**Plain-text extraction.** "
+        if let problem { note += PDFTextExtractor.escapeInline(problem) + " " }
+        note += "This text was extracted from the PDF without Claude, so equations, tables and " +
+                "symbols may be garbled — the PDF view shows the original. Use Paper ▸ Reprocess to try Claude again."
+        let pdfFile = PaperStore.pdfURL(id)
+        let noteText = note
+        let output = await Task.detached(priority: .userInitiated) {
+            PDFTextExtractor.markdown(from: pdfFile, title: knownTitle, note: noteText)
+        }.value
+        try Task.checkCancellation()
+        guard let output, output.textCharacters >= 200 else {
+            throw ImportError.noExtractableText(problem)
+        }
         try update(id, ctx, .converting, "Preparing clean text…")
-        let result = try await WebProcessor.shared.ingestMarkdown(md)
+        let result = try await WebProcessor.shared.ingestMarkdown(output.markdown)
         try await finish(id, ctx, result, kind: .claudeMarkdown)
-        if !isComplete, let p = paper(id, ctx) {
-            p.importStatusDetail = "Text incomplete — the PDF was too long to convert in one pass."
+        if let p = paper(id, ctx) {
+            p.importStatusDetail = Self.localExtractionDetail
             save(ctx)
         }
+    }
+
+    /// Why Claude could not convert, in import wording (never the chat's).
+    private static func conversionProblem(_ error: Error) -> String {
+        if let e = error as? ClaudeError, e.isRefusal {
+            var s = "Claude declined to convert this PDF"
+            if let c = e.refusalCategory, !c.isEmpty { s += " (refusal category: \(c))" }
+            return s + "."
+        }
+        if let e = error as? ImportError {
+            switch e {
+            case .emptyConversion, .conversionTooLong: return "Claude's conversion produced no text."
+            default: break
+            }
+        }
+        return "Claude could not convert the PDF: " + message(for: error)
     }
 
     /// Runs the paid Claude conversion and saves source.md + its sidecar for reuse on retry.
@@ -847,6 +1093,124 @@ final class Importer: ObservableObject {
         if p.doi == nil, let doi = m.externalIds?.doi, let n = DOIParser.normalize(doi) { p.doi = n }
     }
 
+    private func apply(_ e: ArxivEntry, to p: Paper) {
+        let t = e.title.trimmingCharacters(in: .whitespacesAndNewlines)
+        if !t.isEmpty {
+            p.title = Self.clean(t, max: 500)
+            provisionalTitles.remove(p.id)
+        }
+        if !e.authors.isEmpty { p.authors = Array(e.authors.prefix(200)).map { Self.clean($0, max: 200) } }
+        if let y = e.year { p.year = y }
+        if p.abstractText.isEmpty, !e.summary.isEmpty { p.abstractText = Self.clean(e.summary, max: 20_000) }
+        if p.doi == nil, let d = e.doi { p.doi = d }
+    }
+
+    // MARK: Helpers — duplicates
+
+    /// Notes, tags, a reading status, highlights or a chat: things a merge must never discard.
+    private func hasUserData(_ p: Paper, _ ctx: ModelContext) -> Bool {
+        if !p.paperNotes.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty || !p.tags.isEmpty
+            || p.status != .toRead { return true }
+        let pid = p.id
+        let highlights = (try? ctx.fetchCount(FetchDescriptor<Highlight>(predicate: #Predicate { $0.paperId == pid }))) ?? 0
+        if highlights > 0 { return true }
+        let turns = (try? ctx.fetchCount(FetchDescriptor<ChatTurn>(predicate: #Predicate { $0.paperId == pid }))) ?? 0
+        return turns > 0
+    }
+
+    /// Other papers that are the same work: same arXiv id (any version), same DOI, or the
+    /// byte-identical PDF (SHA-256, cached in a sidecar next to each original.pdf).
+    private func duplicates(of id: UUID, _ ctx: ModelContext) async throws -> [Paper] {
+        let p = try require(id, ctx)
+        let base = p.arxivId.map(ArxivID.stripVersion)
+        let doi = p.doi?.lowercased()
+        let others = ((try? ctx.fetch(FetchDescriptor<Paper>())) ?? []).filter { $0.id != id && !$0.isDeleted }
+        var found: [UUID] = others.filter { o in
+            if let base, let a = o.arxivId, ArxivID.stripVersion(a) == base { return true }
+            if let doi, let d = o.doi, d.lowercased() == doi { return true }
+            return false
+        }.map(\.id)
+        if p.hasPDF {
+            let candidates = others.filter { $0.hasPDF && !found.contains($0.id) }.map(\.id)
+            if !candidates.isEmpty {
+                let matches: [UUID] = await Task.detached(priority: .userInitiated) {
+                    guard let mine = PaperStore.pdfSHA256(id) else { return [] }
+                    return candidates.filter { PaperStore.pdfSHA256($0) == mine }
+                }.value
+                found += matches
+            }
+        }
+        try Task.checkCancellation()
+        return found.compactMap { paper($0, ctx) }
+    }
+
+    /// Folds duplicates together. If an existing copy is worth keeping (it has text, user data,
+    /// or work in flight) and this paper has nothing of its own yet, this paper is removed and
+    /// the selection redirected (returns true). Redundant failed copies with nothing in them
+    /// are removed in favour of this one. Papers holding user data are never deleted.
+    private func resolveDuplicates(_ id: UUID, _ ctx: ModelContext) async throws -> Bool {
+        let dups = try await duplicates(of: id, ctx)
+        guard !dups.isEmpty else { return false }
+        let p = try require(id, ctx)
+        let mergeable = p.contentKind == .none && !hasUserData(p, ctx)
+        let keepers = dups.filter {
+            $0.contentKind != .none || $0.importState == .ready || hasUserData($0, ctx) || activeIds.contains($0.id)
+        }
+        if !keepers.isEmpty {
+            guard mergeable else { return false }
+            // Prefer a paper with text, then user data, then the oldest.
+            let keep = keepers.sorted { a, b in
+                let ra = (a.importState == .ready ? 2 : 0) + (hasUserData(a, ctx) ? 1 : 0)
+                let rb = (b.importState == .ready ? 2 : 0) + (hasUserData(b, ctx) ? 1 : 0)
+                return ra != rb ? ra > rb : a.addedAt < b.addedAt
+            }[0]
+            await merge(p, into: keep, ctx)
+            return true
+        }
+        for d in dups {
+            let did = d.id
+            onRedirect?(did, id, nil)
+            queue.removeAll { $0.id == did }
+            refQueue.removeAll { $0.id == did }
+            provisionalTitles.remove(did)
+            PaperStore.delete(d, in: ctx)
+        }
+        return false
+    }
+
+    /// Removes `p` (a fresh duplicate with no user data) in favour of `keep`, handing over its
+    /// PDF and identifiers when `keep` lacks them, and retrying `keep` if it had failed.
+    private func merge(_ p: Paper, into keep: Paper, _ ctx: ModelContext) async {
+        let from = p.id, to = keep.id
+        if p.hasPDF, !keep.hasPDF {
+            let src = PaperStore.pdfURL(from), dst = PaperStore.pdfURL(to)
+            let moved: Bool = await Task.detached(priority: .utility) {
+                do {
+                    if FileManager.default.fileExists(atPath: dst.path) { try FileManager.default.removeItem(at: dst) }
+                    try FileManager.default.moveItem(at: src, to: dst)
+                    if let digest = PaperStore.sha256(of: dst) {
+                        PaperStore.recordPDFHash(to, sha256: digest.hash, size: digest.size)
+                    }
+                    return true
+                } catch {
+                    return false
+                }
+            }.value
+            if moved, let k = paper(to, ctx) { k.hasPDF = true }
+        }
+        guard let keep = paper(to, ctx) else { return }
+        if keep.arxivId == nil, let a = p.arxivId { keep.arxivId = a }
+        if keep.doi == nil, let d = p.doi { keep.doi = d }
+        onRedirect?(from, to, "This paper is already in your library.")
+        queue.removeAll { $0.id == from }
+        refQueue.removeAll { $0.id == from }
+        provisionalTitles.remove(from)
+        reprocessing.remove(from)
+        PaperStore.delete(p, in: ctx)
+        save(ctx)
+        if keep.importState == .failed, !activeIds.contains(to) { retry(keep, context: ctx) }
+    }
+
     private func isPlaceholderTitle(_ p: Paper) -> Bool {
         p.title.hasPrefix(Self.placeholderPrefix) || p.title.isEmpty
     }
@@ -910,6 +1274,8 @@ final class Importer: ObservableObject {
         let dst = PaperStore.pdfURL(id)
         try await Task.detached(priority: .utility) {
             try data.write(to: dst, options: .atomic)
+            let hash = SHA256.hash(data: data).map { String(format: "%02x", $0) }.joined()
+            PaperStore.recordPDFHash(id, sha256: hash, size: data.count)
         }.value
         let p = try require(id, ctx)
         p.hasPDF = true
@@ -943,42 +1309,11 @@ final class Importer: ObservableObject {
         return head.range(of: Data("%PDF-".utf8)) != nil
     }
 
-    struct DetectedArxiv: Sendable {
-        /// Id from the arXiv margin stamp (trusted).
-        var stamp: String?
-        /// First "arXiv:" id mentioned anywhere (unconfirmed; may be a cited preprint).
-        var candidate: String?
-        var firstPage: String
-    }
-
-    /// Text of the first two pages → arXiv stamp, or an unconfirmed candidate.
-    nonisolated static func detectArxivID(in url: URL) -> DetectedArxiv {
-        guard let doc = PDFDocument(url: url) else { return DetectedArxiv(firstPage: "") }
-        var text = ""
-        var first = ""
-        for i in 0..<min(2, doc.pageCount) {
-            if let s = doc.page(at: i)?.string {
-                text += s + "\n"
-                if i == 0 { first = s }
-            }
-        }
-        let stamp = ArxivID.findStamp(text)
-        return DetectedArxiv(stamp: stamp, candidate: stamp == nil ? ArxivID.findInText(text) : nil,
-                             firstPage: first)
-    }
-
     /// Lowercased alphanumeric words.
     nonisolated static func titleWords(_ s: String) -> [String] {
         s.lowercased().split(whereSeparator: { !($0.isLetter || $0.isNumber) }).map(String.init)
     }
 
-    /// Whether `title` (≥ 3 words) appears, word for word, in `text` (e.g. a PDF's first page).
-    nonisolated static func text(_ text: String, containsTitle title: String) -> Bool {
-        let t = titleWords(title)
-        guard t.count >= 3 else { return false }
-        let hay = " " + titleWords(text).joined(separator: " ") + " "
-        return hay.contains(" " + t.joined(separator: " ") + " ")
-    }
 
     /// Normalised title equality, tolerating small differences (punctuation, a word or two).
     nonisolated static func titlesMatch(_ a: String, _ b: String) -> Bool {
@@ -988,5 +1323,736 @@ final class Importer: ObservableObject {
         let sa = Set(wa), sb = Set(wb)
         let jaccard = Double(sa.intersection(sb).count) / Double(sa.union(sb).count)
         return min(wa.count, wb.count) >= 3 && jaccard >= 0.85
+    }
+}
+
+// MARK: - PDF analysis (pure: Foundation + PDFKit only, safe off the main actor)
+
+/// Title comparison used to accept a search hit as "this PDF".
+enum TitleMatch {
+    /// A hit is accepted only at or above this similarity.
+    static let acceptThreshold = 0.9
+
+    /// Lowercased alphanumeric words, diacritics folded.
+    static func words(_ s: String) -> [String] {
+        s.folding(options: [.diacriticInsensitive, .widthInsensitive], locale: nil)
+            .lowercased()
+            .split(whereSeparator: { !($0.isLetter || $0.isNumber) })
+            .map(String.init)
+    }
+
+    /// 0…1: Levenshtein ratio over the titles' alphanumeric characters with all spacing
+    /// removed — PDF text often loses or adds spaces ("Provingand ImprovingthePlatonic").
+    static func similarity(_ a: String, _ b: String) -> Double {
+        let x = Array(words(a).joined()), y = Array(words(b).joined())
+        guard !x.isEmpty, !y.isEmpty else { return 0 }
+        if x == y { return 1 }
+        let longest = max(x.count, y.count)
+        guard longest <= 1000 else { return 0 }
+        // The distance is at least the length difference; skip the DP when that alone fails.
+        if Double(abs(x.count - y.count)) / Double(longest) > 1 - acceptThreshold + 0.05 {
+            return 1 - Double(abs(x.count - y.count)) / Double(longest)
+        }
+        var prev = Array(0...y.count)
+        var cur = [Int](repeating: 0, count: y.count + 1)
+        for i in 1...x.count {
+            cur[0] = i
+            for j in 1...y.count {
+                cur[j] = min(prev[j] + 1, cur[j - 1] + 1, prev[j - 1] + (x[i - 1] == y[j - 1] ? 0 : 1))
+            }
+            swap(&prev, &cur)
+        }
+        return 1 - Double(prev[y.count]) / Double(longest)
+    }
+
+    static func matches(_ a: String, _ b: String) -> Bool { similarity(a, b) >= acceptThreshold }
+}
+
+/// One text line of a PDF page with its font sizes (from `PDFPage.attributedString`).
+struct PDFLine: Sendable {
+    var text: String
+    /// Size covering most of the line's non-space characters.
+    var size: Double
+    /// Largest size on the line (small-caps headings have a large first letter only).
+    var maxSize: Double
+    /// Set in capitals throughout (small caps are already folded to lower case in `text`).
+    var allCaps = false
+}
+
+enum PDFLayout {
+    /// Lines of a page in PDFKit's reading order, empty lines dropped.
+    static func lines(of page: PDFPage) -> [PDFLine] {
+        guard let attr = page.attributedString, attr.length > 0 else {
+            return (page.string ?? "").components(separatedBy: .newlines)
+                .map { $0.trimmingCharacters(in: .whitespaces) }
+                .filter { !$0.isEmpty }
+                .map { PDFLine(text: normalizeGlyphs($0), size: 0, maxSize: 0) }
+        }
+        let ns = attr.string as NSString
+        var out: [PDFLine] = []
+        var parts: [(text: Substring, size: Double)] = []
+        var counts: [Double: Int] = [:]
+        var maxSize = 0.0
+
+        func flush() {
+            let raw = parts.map(\.text).joined()
+            let t = raw.trimmingCharacters(in: .whitespaces)
+            if !t.isEmpty {
+                let dominant = counts.max { a, b in a.value == b.value ? a.key < b.key : a.value < b.value }?.key ?? 0
+                var text = t
+                var caps = false
+                // Small caps set in capitals ("1 I" at 12 pt + "NTRODUCTION" at 9.6 pt): the
+                // smaller capitals stand for lower-case letters.
+                let letters = t.filter(\.isLetter)
+                if letters.count >= 3, letters == letters.uppercased() { caps = true }
+                if caps, maxSize >= dominant * 1.1, t.count <= 150 {
+                    text = parts.map { $0.size < maxSize * 0.9 ? $0.text.lowercased() : String($0.text) }
+                        .joined().trimmingCharacters(in: .whitespaces)
+                }
+                out.append(PDFLine(text: normalizeGlyphs(text), size: dominant, maxSize: maxSize, allCaps: caps))
+            }
+            parts = []
+            counts = [:]
+            maxSize = 0
+        }
+
+        attr.enumerateAttribute(.font, in: NSRange(location: 0, length: attr.length)) { value, range, _ in
+            let size = (value as? NSFont).map { Double($0.pointSize) } ?? 0
+            let key = (size * 2).rounded() / 2
+            let piece = ns.substring(with: range).replacingOccurrences(of: "\r\n", with: "\n")
+                .replacingOccurrences(of: "\r", with: "\n")
+            var first = true
+            for part in piece.split(separator: "\n", omittingEmptySubsequences: false) {
+                if !first { flush() }
+                first = false
+                parts.append((part, size))
+                let visible = part.reduce(0) { $0 + ($1.isWhitespace ? 0 : 1) }
+                if visible > 0 {
+                    counts[key, default: 0] += visible
+                    maxSize = max(maxSize, size)
+                }
+            }
+        }
+        flush()
+        return out
+    }
+
+    /// Most common line size, weighted by characters (the body text size).
+    static func bodySize(_ lines: [PDFLine]) -> Double {
+        var weight: [Double: Int] = [:]
+        for l in lines where l.size > 0 { weight[l.size, default: 0] += l.text.count }
+        return weight.max { a, b in a.value == b.value ? a.key > b.key : a.value < b.value }?.key ?? 0
+    }
+
+    /// Ligatures and other presentation forms PDFKit passes through.
+    static func normalizeGlyphs(_ s: String) -> String {
+        guard s.unicodeScalars.contains(where: { (0xFB00...0xFB06).contains($0.value) || $0.value == 0x00A0 }) else { return s }
+        return s.replacingOccurrences(of: "\u{FB00}", with: "ff")
+            .replacingOccurrences(of: "\u{FB01}", with: "fi")
+            .replacingOccurrences(of: "\u{FB02}", with: "fl")
+            .replacingOccurrences(of: "\u{FB03}", with: "ffi")
+            .replacingOccurrences(of: "\u{FB04}", with: "ffl")
+            .replacingOccurrences(of: "\u{FB05}", with: "st")
+            .replacingOccurrences(of: "\u{FB06}", with: "st")
+            .replacingOccurrences(of: "\u{00A0}", with: " ")
+    }
+
+    /// Joins two wrapped lines, removing a line-break hyphen ("repre-" + "sentation").
+    static func join(_ a: String, _ b: String) -> String {
+        guard !a.isEmpty else { return b }
+        guard !b.isEmpty else { return a }
+        if a.hasSuffix("-"), !a.hasSuffix("--") {
+            let before = a.dropLast().last
+            if before?.isLetter == true, b.first?.isLowercase == true { return String(a.dropLast()) + b }
+            return a + b
+        }
+        return a + " " + b
+    }
+
+    /// The largest-font run of lines near the top of page 1 (the title), with the indices of
+    /// the lines it spans. Nil when nothing stands out from the body text.
+    static func title(in lines: [PDFLine]) -> (text: String, lines: Range<Int>)? {
+        let body = bodySize(lines)
+        guard body > 0 else { return nil }
+        let head = Array(lines.prefix(30))
+        func eligible(_ l: PDFLine) -> Bool {
+            let letters = l.text.reduce(0) { $0 + ($1.isLetter ? 1 : 0) }
+            return letters >= 2 && l.size > 0
+                && l.text.range(of: "arxiv:", options: .caseInsensitive) == nil
+                && !isPageFurniture(l.text)
+        }
+        guard let top = head.filter(eligible).map(\.size).max(), top >= body * 1.15,
+              let start = head.firstIndex(where: { eligible($0) && $0.size >= top * 0.85 }) else { return nil }
+        var end = start
+        var text = ""
+        while end < head.count, end - start < 4, eligible(head[end]), head[end].size >= top * 0.85 {
+            text = join(text, head[end].text)
+            end += 1
+        }
+        let clean = text.split(whereSeparator: { $0.isWhitespace }).joined(separator: " ")
+        guard TitleMatch.words(clean).count >= 2, clean.count <= 300 else { return nil }
+        return (clean, start..<end)
+    }
+
+    private static let pageNumber = try! NSRegularExpression(
+        pattern: #"^(?:page\s+)?[-–—]?\s*(?:\d{1,4}|[ivxlc]{1,7})\s*[-–—]?(?:\s*(?:of|/)\s*\d{1,4})?$"#,
+        options: [.caseInsensitive])
+
+    /// Page numbers ("12", "- 12 -", "Page 3 of 20", "iv").
+    static func isPageFurniture(_ s: String) -> Bool {
+        let t = s.trimmingCharacters(in: .whitespaces)
+        guard t.count <= 20 else { return false }
+        return pageNumber.firstMatch(in: t, range: NSRange(t.startIndex..., in: t)) != nil
+    }
+}
+
+/// What a dropped PDF says about its own identity (first two pages + document metadata).
+struct PDFIdentityHints: Sendable {
+    var readable = false
+    var pageCount = 0
+    /// Trusted: the `arXivID` metadata arXiv adds, or the arXiv margin stamp.
+    var stampArxiv: String?
+    /// Other "arXiv:" ids on the first two pages, header/margin lines first. Unconfirmed: they
+    /// may be cited preprints.
+    var arxivCandidates: [String] = []
+    /// The PDF's own DOI metadata (describes the file itself).
+    var metadataDOI: String?
+    /// DOIs in the text of the first two pages, in order. Unconfirmed.
+    var textDOIs: [String] = []
+    /// Document-info Title, only when it looks like a real title.
+    var metadataTitle: String?
+    var metadataAuthors: [String] = []
+    /// Largest-font text near the top of page 1.
+    var layoutTitle: String?
+    /// Plain text of page 1 (for "does the candidate's title appear here" checks).
+    var firstPage = ""
+
+    /// Title to search for: meaningful metadata first, else the layout title.
+    var titleGuess: String? { metadataTitle ?? layoutTitle }
+}
+
+enum PDFIdentity {
+    private static let doiPattern = try! NSRegularExpression(
+        pattern: #"\b10\.\d{4,9}/[^\s"<>{}]+"#, options: [])
+
+    static func hints(for url: URL, fileStem: String?) -> PDFIdentityHints {
+        var h = PDFIdentityHints()
+        guard let doc = PDFDocument(url: url) else { return h }
+        h.readable = true
+        h.pageCount = doc.pageCount
+
+        // Document metadata. arXiv's own PDFs carry arXivID / DOI keys.
+        for (key, value) in doc.documentAttributes ?? [:] {
+            guard let k = (key as? String)?.lowercased(), let v = value as? String else { continue }
+            switch k {
+            case "arxivid", "arxiv":
+                if case .arxiv(let id)? = PaperInput.parse(v) { h.stampArxiv = id }
+            case "doi":
+                if case .doi(let doi)? = PaperInput.parse(v) { h.metadataDOI = doi }
+            case "title":
+                h.metadataTitle = meaningfulTitle(v, fileStem: fileStem)
+            case "author":
+                h.metadataAuthors = v.split(whereSeparator: { $0 == ";" || $0 == "\n" })
+                    .map { $0.trimmingCharacters(in: .whitespaces) }
+                    .filter { !$0.isEmpty && $0.count <= 200 }
+            default:
+                break
+            }
+        }
+        if h.stampArxiv == nil, let doi = h.metadataDOI, let ax = ArxivID.fromArxivDOI(doi) {
+            h.stampArxiv = ax
+        }
+
+        var text = ""
+        var headerText = ""
+        for i in 0..<min(2, doc.pageCount) {
+            guard let page = doc.page(at: i) else { continue }
+            let s = page.string ?? ""
+            text += s + "\n"
+            if i == 0 { h.firstPage = s }
+            let lines = PDFLayout.lines(of: page)
+            if i == 0, h.layoutTitle == nil { h.layoutTitle = PDFLayout.title(in: lines)?.text }
+            // Header/margin: the first and last few lines, and anything set much larger than
+            // the body (arXiv's rotated margin stamp is 20 pt).
+            let body = PDFLayout.bodySize(lines)
+            for (j, l) in lines.enumerated()
+            where j < 4 || j >= lines.count - 4 || (body > 0 && l.size >= body * 1.5) {
+                headerText += l.text + "\n"
+            }
+        }
+        if h.stampArxiv == nil { h.stampArxiv = ArxivID.findStamp(text) }
+
+        var candidates = ArxivID.findAllInText(headerText)
+        for id in ArxivID.findAllInText(text) where !candidates.contains(id) { candidates.append(id) }
+
+        var dois: [String] = []
+        let range = NSRange(text.startIndex..., in: text)
+        for m in doiPattern.matches(in: text, range: range).prefix(20) {
+            guard let r = Range(m.range, in: text) else { continue }
+            var raw = String(text[r])
+            while let last = raw.last, ".,;:)]}'".contains(last) { raw.removeLast() }
+            guard let doi = DOIParser.normalize(raw),
+                  !dois.contains(where: { $0.caseInsensitiveCompare(doi) == .orderedSame }) else { continue }
+            if let ax = ArxivID.fromArxivDOI(doi) {
+                if !candidates.contains(ax) { candidates.append(ax) }
+            } else {
+                dois.append(doi)
+            }
+        }
+        h.textDOIs = Array(dois.prefix(5))
+        if let stamp = h.stampArxiv {
+            candidates.removeAll { ArxivID.stripVersion($0) == ArxivID.stripVersion(stamp) }
+        }
+        h.arxivCandidates = Array(candidates.prefix(5))
+        return h
+    }
+
+    /// A document-info Title worth searching for (not "Microsoft Word - draft3.docx", a file
+    /// name, or a one-word placeholder).
+    static func meaningfulTitle(_ raw: String, fileStem: String?) -> String? {
+        let t = raw.split(whereSeparator: { $0.isWhitespace }).joined(separator: " ")
+        let lower = t.lowercased()
+        guard t.count >= 8, t.count <= 300, TitleMatch.words(t).count >= 3 else { return nil }
+        let junk = ["microsoft word", "untitled", "title of", "paper title", "your title", "insert title"]
+        if junk.contains(where: { lower.hasPrefix($0) }) { return nil }
+        if lower.range(of: #"\.(pdf|tex|dvi|ps|docx?|odt|rtf|pages)$"#, options: .regularExpression) != nil { return nil }
+        if !t.contains(" ") { return nil }
+        if let stem = fileStem, TitleMatch.words(stem) == TitleMatch.words(t) { return nil }
+        return t
+    }
+}
+
+/// Local, offline PDF → Markdown (no Claude): PDFKit text per page with running headers,
+/// footers and page numbers dropped, line-break hyphens removed, lines joined into paragraphs
+/// and headings detected from font sizes. Equations come out as plain (often garbled) text.
+enum PDFTextExtractor {
+    struct Output: Sendable {
+        var markdown: String
+        /// Characters of body text extracted (excluding the title and the note).
+        var textCharacters: Int
+        var pages: Int
+        var headings: Int
+        var paragraphs: Int
+    }
+
+    private static let captionStart = try! NSRegularExpression(
+        pattern: #"^(Figure|Fig\.|Table|Algorithm|Listing)\s*([A-Z]?\d+(?:\.\d+)?[a-z]?)\s*[.:|]\s*"#)
+    private static let numbered = try! NSRegularExpression(
+        pattern: #"^((?:\d{1,2}|[A-Z])(?:\.\d{1,2})*)\.?\s+\S"#)
+    private static let knownHeading = try! NSRegularExpression(
+        pattern: #"^(abstract|introduction|background|related work|preliminaries|method(s|ology)?|experiments?|results|discussion|limitations|conclusions?|references|bibliography|acknowledg(e)?ments?|appendix|appendices|supplementary material)\b"#,
+        options: [.caseInsensitive])
+    private static let bullet = try! NSRegularExpression(pattern: #"^[•◦▪∙·●○■□–]\s+"#)
+
+    static func markdown(from url: URL, title: String?, note: String?) -> Output? {
+        guard let doc = PDFDocument(url: url) else { return nil }
+        return markdown(from: doc, title: title, note: note)
+    }
+
+    static func markdown(from doc: PDFDocument, title: String?, note: String?) -> Output? {
+        let pageCount = min(doc.pageCount, 2000)
+        guard pageCount > 0 else { return nil }
+        var pages: [[PDFLine]] = (0..<pageCount).map { i in
+            doc.page(at: i).map(PDFLayout.lines(of:)) ?? []
+        }
+        let body = PDFLayout.bodySize(pages.flatMap { $0 })
+
+        // Running headers / footers: the same text (digits ignored) among the first or last
+        // three lines of many pages.
+        func furnitureKey(_ s: String) -> String {
+            s.lowercased().replacingOccurrences(of: #"\d+"#, with: "#", options: .regularExpression)
+                .split(whereSeparator: { $0.isWhitespace }).joined(separator: " ")
+        }
+        let edge = 3
+        var edgeCounts: [String: Int] = [:]
+        for lines in pages {
+            var seen = Set<String>()
+            for (j, l) in lines.enumerated() where j < edge || j >= lines.count - edge {
+                let k = furnitureKey(l.text)
+                if !k.isEmpty, seen.insert(k).inserted { edgeCounts[k, default: 0] += 1 }
+            }
+        }
+        let repeatThreshold = max(3, Int((Double(pageCount) * 0.3).rounded(.up)))
+        for p in pages.indices {
+            let lines = pages[p]
+            pages[p] = lines.enumerated().compactMap { j, l in
+                let atEdge = j < edge || j >= lines.count - edge
+                if atEdge {
+                    if PDFLayout.isPageFurniture(l.text) { return nil }
+                    if pageCount >= 4, (edgeCounts[furnitureKey(l.text)] ?? 0) >= repeatThreshold { return nil }
+                }
+                // The arXiv margin stamp, wherever PDFKit places it in the reading order.
+                if l.text.count <= 80, ArxivID.findStamp(l.text) != nil { return nil }
+                // Figure-internal labels (axis ticks, legends): short lines in a small font.
+                if body > 0, l.size > 0, l.maxSize < body * 0.9, l.text.count < 40, !isCaption(l.text) { return nil }
+                return l
+            }
+        }
+
+        // Title: given (from metadata) or the largest text on page 1. Its lines are removed.
+        var docTitle = title?.trimmingCharacters(in: .whitespacesAndNewlines)
+        if let found = PDFLayout.title(in: pages[0]) {
+            if docTitle == nil || docTitle!.isEmpty { docTitle = found.text }
+            if docTitle.map({ TitleMatch.similarity($0, found.text) >= 0.6 }) == true {
+                pages[0].removeSubrange(found.lines)
+            }
+        }
+
+        let shownTitle = (docTitle?.isEmpty == false ? docTitle! : "Untitled paper")
+
+        var blocks: [Block] = []
+        var para = ""
+        var paraKind: ParaKind = .text
+        var lastLine: PDFLine?
+        var lastWasHeadingLine = false
+        var seenHeading = false
+
+        func flushPara() {
+            let t = para.trimmingCharacters(in: .whitespaces)
+            para = ""
+            defer { paraKind = .text }
+            guard !t.isEmpty else { return }
+            // Body text interrupted by a figure, footnote or page break resumes mid-sentence
+            // (lower-case start): append it to the unfinished paragraph it belongs to.
+            if paraKind == .text, let first = t.first, first.isLowercase,
+               let k = blocks.indices.reversed().prefix(6).first(where: { blocks[$0].isOpenText }),
+               !blocks[k...].contains(where: \.isHeading) {
+                blocks[k].append(t)
+                return
+            }
+            // Isolated scraps after the front matter: figure labels, stray numbers.
+            if paraKind == .text, seenHeading, isScrap(t) { return }
+            blocks.append(.paragraph(paraKind, t))
+        }
+
+        for (pageIndex, lines) in pages.enumerated() {
+            let bodyLens = lines.filter { body == 0 || abs($0.size - body) <= 0.75 }.map(\.text.count).sorted()
+            let typical = bodyLens.isEmpty ? 80 : bodyLens[min(bodyLens.count - 1, Int(Double(bodyLens.count) * 0.8))]
+            for line in lines {
+                let t = line.text
+                var level = headingLevel(line, body: body)
+                // Front matter (authors, affiliations) is often set larger than the body: on
+                // page 1, before the first real section, only numbered or known headings count.
+                if level != nil, pageIndex == 0, !seenHeading, !isSectionHeading(t) { level = nil }
+                if let level {
+                    if lastWasHeadingLine, case .heading(let lv, let prev)? = blocks.last,
+                       numbered.firstMatch(in: t, range: NSRange(t.startIndex..., in: t)) == nil,
+                       let lastLine, abs(lastLine.size - line.size) < 0.6, prev.count < 160 {
+                        // A heading wrapped onto a second line.
+                        blocks[blocks.count - 1] = .heading(lv, prev + " " + headingText(t))
+                    } else {
+                        flushPara()
+                        blocks.append(.heading(level, headingText(t)))
+                        seenHeading = true
+                    }
+                    lastWasHeadingLine = true
+                    lastLine = line
+                    continue
+                }
+                let startsCaption = isCaption(t)
+                let startsBullet = bullet.firstMatch(in: t, range: NSRange(t.startIndex..., in: t)) != nil
+                let captionEnds = paraKind == .caption && (para.last.map { ".!?".contains($0) } ?? false)
+                    && t.first?.isLowercase == true
+                if para.isEmpty {
+                    paraKind = startsCaption ? .caption : (startsBullet ? .bullet : .text)
+                    para = startsBullet ? stripBullet(t) : t
+                } else if startsCaption || startsBullet || captionEnds
+                            || shouldBreak(after: lastLine, before: line, typical: typical, body: body) {
+                    flushPara()
+                    paraKind = startsCaption ? .caption : (startsBullet ? .bullet : .text)
+                    para = startsBullet ? stripBullet(t) : t
+                } else {
+                    para = PDFLayout.join(para, t)
+                }
+                lastWasHeadingLine = false
+                lastLine = line
+            }
+            // Page break: the open paragraph is closed; if it ended mid-sentence, the next
+            // page's lower-case continuation is appended to it again by flushPara.
+            flushPara()
+        }
+        flushPara()
+
+        var out: [String] = ["# " + escapeInline(shownTitle)]
+        if let note, !note.isEmpty { out.append("> " + note) }
+        var textChars = 0, headings = 0, paragraphs = 0
+        for b in blocks {
+            switch b {
+            case .heading(let level, let text):
+                headings += 1
+                out.append(String(repeating: "#", count: level) + " " + escapeInline(text))
+            case .paragraph(let kind, let text):
+                paragraphs += 1
+                textChars += text.count
+                out.append(render(text, kind: kind))
+            }
+        }
+        return Output(markdown: out.joined(separator: "\n\n") + "\n", textCharacters: textChars,
+                      pages: pageCount, headings: headings, paragraphs: paragraphs)
+    }
+
+    private enum Block {
+        case heading(Int, String)
+        case paragraph(ParaKind, String)
+
+        var isHeading: Bool { if case .heading = self { return true } else { return false } }
+
+        /// A body paragraph that stopped mid-sentence.
+        var isOpenText: Bool {
+            guard case .paragraph(.text, let t) = self, let last = t.last else { return false }
+            return !".!?:;”\")]".contains(last)
+        }
+
+        mutating func append(_ more: String) {
+            if case .paragraph(let k, let t) = self { self = .paragraph(k, PDFLayout.join(t, more)) }
+        }
+    }
+
+    /// Short fragments with no sentence shape (axis labels, legend words, stray numbers).
+    private static func isScrap(_ t: String) -> Bool {
+        guard t.count < 25 else { return false }
+        if t.contains(":") || t.contains("<") { return false }
+        if let last = t.last, ".!?".contains(last) { return false }
+        return t.split(whereSeparator: { $0.isWhitespace }).count <= 3
+    }
+
+    private enum ParaKind { case text, caption, bullet }
+
+    /// "3 Results", "A.1 Proofs", "Abstract", "References" …
+    private static func isSectionHeading(_ t: String) -> Bool {
+        let r = NSRange(t.startIndex..., in: t)
+        if knownHeading.firstMatch(in: t, range: r) != nil { return true }
+        guard let m = numbered.firstMatch(in: t, range: r), let nr = Range(m.range(at: 1), in: t) else { return false }
+        return t[nr].first?.isNumber == true
+    }
+
+    private static func isCaption(_ s: String) -> Bool {
+        captionStart.firstMatch(in: s, range: NSRange(s.startIndex..., in: s)) != nil
+    }
+
+    private static func stripBullet(_ s: String) -> String {
+        bullet.stringByReplacingMatches(in: s, range: NSRange(s.startIndex..., in: s), withTemplate: "")
+    }
+
+    private static func shouldBreak(after prev: PDFLine?, before line: PDFLine, typical: Int, body: Double) -> Bool {
+        guard let prev else { return false }
+        // A change of text size (body → footnote, caption → body).
+        if prev.size > 0, line.size > 0, abs(prev.size - line.size) >= 1.0 { return true }
+        let p = prev.text
+        let short = Double(p.count) < Double(typical) * 0.75
+        if short, let last = p.last, ".!?:”\")".contains(last) { return true }
+        // Very short lines (author lists, affiliations, list items) stand alone.
+        if Double(p.count) < Double(typical) * 0.45, p.count < 60 { return true }
+        return false
+    }
+
+    /// Heading level (2…4) for a line that looks like a section heading, else nil.
+    private static func headingLevel(_ l: PDFLine, body: Double) -> Int? {
+        let t = l.text.trimmingCharacters(in: .whitespaces)
+        let words = t.split(whereSeparator: { $0.isWhitespace }).count
+        let letters = t.reduce(0) { $0 + ($1.isLetter ? 1 : 0) }
+        guard t.count >= 2, t.count <= 100, letters >= 2, words <= 14, body > 0 else { return nil }
+        if let last = t.last, ",;".contains(last) { return nil }
+        if t.hasSuffix("."), words > 6 { return nil }
+        if isCaption(t) { return nil }
+        let range = NSRange(t.startIndex..., in: t)
+        let numMatch = numbered.firstMatch(in: t, range: range)
+        let isKnown = knownHeading.firstMatch(in: t, range: range) != nil && words <= 4
+        let allCaps = l.allCaps
+        let dominantLarger = l.size >= body * 1.12
+        let anyLarger = l.maxSize >= body * 1.12
+        // A single capital letter as the "number" ("A Study of…") only counts in a larger font.
+        var number: String?
+        if let m = numMatch, let r = Range(m.range(at: 1), in: t) {
+            let n = String(t[r])
+            if n.count > 1 || n.first?.isNumber == true || dominantLarger || anyLarger { number = n }
+        }
+
+        let isHeading: Bool
+        if dominantLarger {
+            isHeading = true
+        } else if anyLarger {
+            isHeading = number != nil || isKnown || allCaps
+        } else {
+            // Body-sized: only an exact known heading word, or a numbered all-caps line.
+            isHeading = (isKnown && words <= 2 && (allCaps || t.first?.isUppercase == true) && !t.hasSuffix("."))
+                || (number != nil && allCaps && words <= 8)
+        }
+        guard isHeading else { return nil }
+        if let number {
+            let depth = number.split(separator: ".").count
+            return min(4, depth + 1)
+        }
+        return 2
+    }
+
+    /// All-caps headings ("1 INTRODUCTION") in title case.
+    private static func headingText(_ s: String) -> String {
+        let letters = s.filter(\.isLetter)
+        guard letters.count >= 4, letters == letters.uppercased() else { return s }
+        return s.split(separator: " ", omittingEmptySubsequences: true).map { w -> String in
+            let word = String(w)
+            guard word.contains(where: \.isLetter) else { return word }
+            return word.prefix(1).uppercased() + word.dropFirst().lowercased()
+        }.joined(separator: " ")
+    }
+
+    private static func render(_ t: String, kind: ParaKind) -> String {
+        switch kind {
+        case .caption:
+            let r = NSRange(t.startIndex..., in: t)
+            if let m = captionStart.firstMatch(in: t, range: r),
+               let labelR = Range(m.range(at: 1), in: t), let numR = Range(m.range(at: 2), in: t),
+               let all = Range(m.range, in: t) {
+                let label = t[labelR] == "Fig." ? "Figure" : String(t[labelR])
+                return "> **\(label) \(t[numR]).** " + escapeInline(String(t[all.upperBound...]))
+            }
+            return "> " + escapeInline(t)
+        case .bullet:
+            return "- " + escapeInline(t)
+        case .text:
+            return escapeBlockStart(escapeInline(t))
+        }
+    }
+
+    /// Escapes Markdown syntax in extracted text. `[` is left alone: `\[` is a display-math
+    /// delimiter for the ingest step.
+    static func escapeInline(_ s: String) -> String {
+        var out = ""
+        out.reserveCapacity(s.count + 8)
+        for ch in s {
+            switch ch {
+            case "\\", "$", "*", "_", "`", "<", "~", "|":
+                out.append("\\")
+                out.append(ch)
+            default:
+                if let scalar = ch.unicodeScalars.first, ch.unicodeScalars.count == 1,
+                   CharacterSet.controlCharacters.contains(scalar) {
+                    out.append(" ")
+                } else {
+                    out.append(ch)
+                }
+            }
+        }
+        return out
+    }
+
+    /// A paragraph must not start a heading, quote, list or rule by accident.
+    private static func escapeBlockStart(_ s: String) -> String {
+        if let first = s.first, "#>+-=".contains(first) { return "\\" + s }
+        if let r = s.range(of: #"^\d{1,9}[.)](?=\s)"#, options: .regularExpression) {
+            var t = s
+            t.insert("\\", at: s.index(before: r.upperBound))
+            return t
+        }
+        return s
+    }
+}
+
+extension TitleMatch {
+    /// Whether `title` (≥ 3 words) appears in `text` (e.g. a PDF's first page) — word for word,
+    /// or, for PDFs whose text lost its spaces, as a run of the same letters and digits.
+    static func text(_ text: String, containsTitle title: String) -> Bool {
+        let t = words(title)
+        guard t.count >= 3 else { return false }
+        let hayWords = words(text)
+        if (" " + hayWords.joined(separator: " ") + " ").contains(" " + t.joined(separator: " ") + " ") { return true }
+        let compactTitle = t.joined()
+        return compactTitle.count >= 15 && hayWords.joined().contains(compactTitle)
+    }
+}
+
+/// How a dropped PDF was identified.
+struct PDFIdentityResolution: Sendable {
+    enum Source: String, Sendable { case stamp, arxivMention, doi, title }
+    var arxivId: String?
+    var doi: String?
+    var s2: S2Paper?
+    var arxiv: ArxivEntry?
+    var source: Source
+}
+
+/// Identifies a dropped PDF before anything is paid for: (a) arXiv metadata / margin stamp,
+/// or an "arXiv:" mention confirmed by its title; (b) a DOI → Semantic Scholar → arXiv id;
+/// (c) the title (document info or largest text on page 1) → Semantic Scholar title match and
+/// the arXiv API, accepted only at ≥ 0.9 normalised-title similarity. Network failures at any
+/// step just move on to the next one.
+enum PDFIdentityResolver {
+    static func resolve(_ h: PDFIdentityHints,
+                        status: @escaping @Sendable (String) async -> Void) async throws -> PDFIdentityResolution? {
+        // (a) The PDF's own arXiv id.
+        if let id = h.stampArxiv {
+            return PDFIdentityResolution(arxivId: id, doi: h.metadataDOI, source: .stamp)
+        }
+        for candidate in h.arxivCandidates.prefix(3) {
+            try Task.checkCancellation()
+            await status("Checking arXiv id…")
+            let s2 = try? await ScholarAPI.paper(ScholarAPI.arxivID(candidate))
+            try Task.checkCancellation()
+            var entry: ArxivEntry?
+            var title = s2?.cleanTitle
+            if title == nil {
+                entry = try? await ArxivAPI.entry(id: candidate)
+                title = entry?.title
+            }
+            if let title, confirms(title, h) {
+                return PDFIdentityResolution(arxivId: candidate, doi: s2?.externalIds?.doi, s2: s2,
+                                             arxiv: entry, source: .arxivMention)
+            }
+        }
+
+        // (b) DOI: the PDF's own metadata DOI is trusted; DOIs in the text may be citations, so
+        // their title must match this PDF.
+        var dois: [String] = []
+        if let d = h.metadataDOI { dois.append(d) }
+        for d in h.textDOIs where !dois.contains(where: { $0.caseInsensitiveCompare(d) == .orderedSame }) { dois.append(d) }
+        for doi in dois.prefix(3) {
+            try Task.checkCancellation()
+            await status("Looking up DOI…")
+            guard let m = try? await ScholarAPI.paper(ScholarAPI.doiID(doi)) else { continue }
+            try Task.checkCancellation()
+            let trusted = doi == h.metadataDOI
+            guard trusted || (m.cleanTitle.map { confirms($0, h) } ?? false) else { continue }
+            return PDFIdentityResolution(arxivId: validArxiv(m.externalIds?.arXiv), doi: doi, s2: m, source: .doi)
+        }
+
+        // (c) Title search.
+        guard let title = h.titleGuess else { return nil }
+        try Task.checkCancellation()
+        await status("Searching for the title…")
+        var s2Hit: S2Paper?
+        if let m = try? await ScholarAPI.matchPaper(title: title), let t = m.cleanTitle, TitleMatch.matches(t, title) {
+            if let ax = validArxiv(m.externalIds?.arXiv) {
+                return PDFIdentityResolution(arxivId: ax, doi: m.externalIds?.doi.flatMap(DOIParser.normalize),
+                                             s2: m, source: .title)
+            }
+            s2Hit = m
+        }
+        try Task.checkCancellation()
+        await status("Searching arXiv for the title…")
+        if let entries = try? await ArxivAPI.search(title: title),
+           let e = entries.max(by: { TitleMatch.similarity($0.title, title) < TitleMatch.similarity($1.title, title) }),
+           TitleMatch.matches(e.title, title) {
+            return PDFIdentityResolution(arxivId: ArxivID.stripVersion(e.id),
+                                         doi: s2Hit?.externalIds?.doi.flatMap(DOIParser.normalize) ?? e.doi,
+                                         s2: s2Hit, arxiv: e, source: .title)
+        }
+        if let s2Hit {
+            return PDFIdentityResolution(arxivId: nil, doi: s2Hit.externalIds?.doi.flatMap(DOIParser.normalize),
+                                         s2: s2Hit, source: .title)
+        }
+        return nil
+    }
+
+    /// A looked-up title belongs to this PDF if it is printed on page 1 or matches the PDF's
+    /// own title.
+    static func confirms(_ title: String, _ h: PDFIdentityHints) -> Bool {
+        if TitleMatch.text(h.firstPage, containsTitle: title) { return true }
+        return [h.metadataTitle, h.layoutTitle].contains { $0.map { TitleMatch.matches($0, title) } ?? false }
+    }
+
+    private static func validArxiv(_ raw: String?) -> String? {
+        guard let id = raw?.trimmingCharacters(in: .whitespaces), ArxivID.isValid(id) else { return nil }
+        return id
     }
 }

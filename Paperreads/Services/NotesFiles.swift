@@ -203,7 +203,9 @@ enum NotesFiles {
             context = c.mainContext
         } else if let s = AppCommands.shared.session {
             context = s.context
-        } else if let container = try? ModelContainer(for: Schema(SchemaV1.models)) {
+        } else if let container = try? ModelContainer(
+            for: Schema(SchemaV1.models),
+            configurations: ModelConfiguration(schema: Schema(SchemaV1.models), url: PaperStore.storeURL)) {
             context = ModelContext(container)
         } else {
             return []

@@ -54,6 +54,11 @@ body {
 }
 #paper > h2:first-child,
 #paper > :first-child h2:first-child { border-top: 0; padding-top: 0; }
+/* the abstract's label is a small-caps caption, not a section heading */
+#paper .abstract > h2:first-child { border-top: 0; padding-top: 0; font-family: var(--rounded); }
+/* the first real section after the abstract keeps its hairline */
+#paper > .abstract:first-child + h2,
+#paper > .abstract:first-child + :not(h2) h2:first-child { border-top: 1px solid var(--hairline); padding-top: 1.1em; }
 
 /* highlights */
 mark.hl {

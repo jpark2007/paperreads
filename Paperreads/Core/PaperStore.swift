@@ -1,5 +1,6 @@
 import Foundation
 import SwiftData
+import CryptoKit
 
 // CONTRACT FILE — on-disk layout for paper content. All file IO goes through here.
 //
@@ -10,6 +11,8 @@ import SwiftData
 //   papers/<uuid>/blocks.json      [ContentBlock]
 //   papers/<uuid>/source.md        Claude markdown (claudeMarkdown papers only)
 //   papers/<uuid>/source.json      SourceConversionInfo for source.md (reuse on retry)
+//   papers/<uuid>/original.sha256  PDFHashInfo: SHA-256 of original.pdf (duplicate detection)
+//   library.store (+ -wal, -shm)   SwiftData store (`storeURL`)
 
 enum PaperStore {
     static let appSupport: URL = {
@@ -19,6 +22,10 @@ enum PaperStore {
                                                  attributes: [.posixPermissions: 0o700])
         return dir
     }()
+
+    /// The SwiftData store. Lives in our own folder: an unsandboxed app's default
+    /// (`Application Support/default.store`) is shared with every other such app.
+    static var storeURL: URL { appSupport.appendingPathComponent("library.store") }
 
     static func dir(for id: UUID) -> URL {
         let d = appSupport.appendingPathComponent("papers", isDirectory: true)
@@ -63,6 +70,67 @@ enum PaperStore {
         try? FileManager.default.removeItem(at: markdownInfoURL(id))
         try Data(markdown.utf8).write(to: markdownURL(id), options: .atomic)
         try JSONEncoder().encode(info).write(to: markdownInfoURL(id), options: .atomic)
+    }
+
+    // MARK: PDF hash (duplicate detection)
+
+    /// Identifies the original.pdf a hash was computed for (size + modification time).
+    struct PDFHashInfo: Codable, Sendable {
+        var size: Int
+        var modified: Double
+        var sha256: String
+    }
+
+    private static func existingDir(_ id: UUID) -> URL {
+        appSupport.appendingPathComponent("papers", isDirectory: true)
+            .appendingPathComponent(id.uuidString, isDirectory: true)
+    }
+
+    static func pdfHashURL(_ id: UUID) -> URL { existingDir(id).appendingPathComponent("original.sha256") }
+
+    /// Streaming SHA-256 (hex) and size of a file; nil if it can't be read.
+    static func sha256(of url: URL) -> (hash: String, size: Int)? {
+        guard let handle = try? FileHandle(forReadingFrom: url) else { return nil }
+        defer { try? handle.close() }
+        var hasher = SHA256()
+        var size = 0
+        while true {
+            let chunk: Data
+            do { chunk = try handle.read(upToCount: 1 << 20) ?? Data() } catch { return nil }
+            if chunk.isEmpty { break }
+            size += chunk.count
+            hasher.update(data: chunk)
+        }
+        let hex = hasher.finalize().map { String(format: "%02x", $0) }.joined()
+        return (hex, size)
+    }
+
+    /// Records the hash of the paper's current original.pdf. Never creates the paper directory
+    /// (the paper may have been deleted meanwhile).
+    static func recordPDFHash(_ id: UUID, sha256: String, size: Int) {
+        let pdf = existingDir(id).appendingPathComponent("original.pdf")
+        guard let attrs = try? FileManager.default.attributesOfItem(atPath: pdf.path),
+              let modified = (attrs[.modificationDate] as? Date)?.timeIntervalSince1970,
+              (attrs[.size] as? NSNumber)?.intValue == size else { return }
+        let info = PDFHashInfo(size: size, modified: modified, sha256: sha256)
+        if let data = try? JSONEncoder().encode(info) { try? data.write(to: pdfHashURL(id), options: .atomic) }
+    }
+
+    /// SHA-256 of the paper's original.pdf: from the sidecar when it still describes the file,
+    /// else computed (and the sidecar refreshed). Nil if there is no PDF.
+    static func pdfSHA256(_ id: UUID) -> String? {
+        let pdf = existingDir(id).appendingPathComponent("original.pdf")
+        guard let attrs = try? FileManager.default.attributesOfItem(atPath: pdf.path),
+              let size = (attrs[.size] as? NSNumber)?.intValue, size > 0 else { return nil }
+        let modified = (attrs[.modificationDate] as? Date)?.timeIntervalSince1970 ?? 0
+        if let data = try? Data(contentsOf: pdfHashURL(id)),
+           let info = try? JSONDecoder().decode(PDFHashInfo.self, from: data),
+           info.size == size, info.modified == modified, info.sha256.count == 64 {
+            return info.sha256
+        }
+        guard let digest = sha256(of: pdf) else { return nil }
+        recordPDFHash(id, sha256: digest.hash, size: digest.size)
+        return digest.hash
     }
 
     static func writeContent(_ result: IngestResult, for id: UUID) throws {

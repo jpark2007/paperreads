@@ -437,8 +437,13 @@ final class ChatEngine: ObservableObject {
         if !paperAuthors.isEmpty { meta.append(paperAuthors.joined(separator: ", ")) }
         if let y = paperYear { meta.append(String(y)) }
         if !meta.isEmpty { paper += meta.joined(separator: " · ") + "\n" }
+        // Ingest now keeps the abstract in the body as an "Abstract" section; only add the
+        // separate abstract when the blocks don't already carry it.
         let abstract = paperAbstract.trimmingCharacters(in: .whitespacesAndNewlines)
-        if !abstract.isEmpty { paper += "\n## Abstract\n\(abstract)\n" }
+        let blocksHaveAbstract = blocks.contains {
+            $0.section.trimmingCharacters(in: .whitespacesAndNewlines).caseInsensitiveCompare("Abstract") == .orderedSame
+        }
+        if !abstract.isEmpty && !blocksHaveAbstract { paper += "\n## Abstract\n\(abstract)\n" }
 
         var currentSection: String?
         for block in blocks.sorted(by: { $0.b < $1.b }) {

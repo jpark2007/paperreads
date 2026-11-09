@@ -428,3 +428,105 @@ even while the Ask tab is showing. Title/tag/status edits made elsewhere refresh
 time that paper's Notes panel appears or on Export all.
 (§5's `Reader.load` signature is superseded by §8: it also takes `position`/`prefs` and returns
 `{maxBlock}`.)
+
+## 10. Ingest fidelity (pictures, abstract, images) + regression harness
+
+**Pictures.** LaTeXML draws tcolorbox/framed environments and TikZ/pgfplots as `<svg class="ltx_picture">`;
+the sanitizer still drops every `<svg>`, so `ingest.js` converts them first (`convertPictures`, before
+equations/math): an SVG with ≤4 foreignObjects whose widest spans ≥60% of the picture (and no drawn
+`<text>`) is a **box** → `div.box`, its foreignObject contents in order; a short (≤25 words) first one
+of several is the title bar → `p.box-title`. LaTeXML's inline-mode spans inside are turned back into
+blocks (`span.ltx_p`→p, `ltx_para`/minipage→div, `ltx_figure`/`ltx_caption`→figure/figcaption, items→li),
+and span-form equation tables (`span.ltx_eqn_table > … .ltx_eqn_row`) become `div.eq` like table ones.
+Any other SVG → `<img class="diagram" src="data:image/svg+xml;base64,…">` built from a sanitized copy
+(`Paperreads.buildSafeSVG`: SVG shape/text/gradient/marker elements only; no script, style element,
+foreignObject, image, animation or filters; no `on*`; `href` only `#frag`; no external `url()`),
+foreignObject labels redrawn as SVG `<text>` and also copied into `alt`. `safeImgSrc` accepts
+`data:image/svg+xml` ONLY as base64 whose decoded document passes the same allowlist
+(`isSafeSVGDataURL`), so the reader's re-sanitize rejects anything else. New own classes: `box`,
+`box-title`, `diagram`.
+**Abstract.** Both paths keep the abstract in the body as the first element:
+`div.abstract > h2 "Abstract" + paragraphs` (so its blocks have section `"Abstract"` and reach
+Claude via blocks.json); `IngestResult.abstract` is still filled. Title text drops `.ltx_pubnotes`
+("Thanks:" notes).
+**Images.** `effectiveBase` no longer treats `/html/<id>` as a directory: arXiv image paths already
+carry the versioned id, so every figure resolved to `/html/<id>/<id>vN/…` (404). Spacer tables with
+no content are pruned. KaTeX retries with `\begin{array}[…]` position arguments removed.
+**Typography.** `.prose p` gap 0.9em; the trailing-margin trim applies only inside li/blockquote/
+cells/figcaption/box (LaTeXML wraps each paragraph in its own div, so a generic `p:last-child` removed
+every gap; chat keeps `.body.prose > :last-child` flush). `.box`: 1px hairline, radius 6, small-caps
+rounded title; the abstract label uses the same caps style.
+**Harness** `tools/ingest-check/run.sh [opts] [ids|file.html]` (swiftc → scratch dir; offscreen
+WKWebView, `.prohibited` activation): loads the real `Web/ingest.html`, fetches arxiv.org/html/<id>
+(fallback ar5iv; cached), runs `Ingest.fromArxivHTML` and reports coverage of every source passage
+≥6 words (paragraphs, abstract, captions, cells, footnotes, bib items, headings, items, listing
+lines) in the block texts (diagram labels count only via image text/alt, reported separately), math
+/eq/image/box counts and missing snippets; `--render DIR [--shots n] [--focus css]` renders
+`reader.html` and writes PNGs (plus KaTeX fallback and broken-image counts); `--dump`, `--json`,
+`--min` (exit 1 below, default 0.98). Regression set: 2610.39302v1, 1706.03762, 2511.18397,
+2006.11239, 2611.09685v1 — all 100% (JEPA: 97.2% in blocks + 9 TikZ labels in image/alt).
+
+## 11. PDF import robustness, dedupe, Reprocess, store location
+
+(Supersedes the dropped-PDF parts of §3 and the `.modelContainer(for:)` line in §6.)
+
+**Identify before paying** (`PDFIdentity.hints` + `PDFIdentityResolver.resolve`, pure code at the end
+of `Importer.swift`): (a) the PDF's `arXivID`/`DOI` document metadata or the margin stamp
+`arXiv:id [cat]` (trusted); other `arXiv:` ids on pages 1–2 (header/margin lines and ≥1.5× body
+size first) only if Semantic Scholar's/arXiv's title for that id is printed on page 1 or matches
+the PDF title; (b) DOIs (metadata trusted; text DOIs need the same title check) →
+`ScholarAPI.paper(DOI:)` → `externalIds.ArXiv`; (c) title = meaningful document-info Title, else
+the largest-font lines near the top of page 1 (`PDFLayout.title`, small caps folded) →
+`ScholarAPI.matchPaper(title:)` then `ArxivAPI.search(title:)` (Atom via XMLParser, 3 s spacing),
+accepted only at `TitleMatch.similarity ≥ 0.9` (Levenshtein ratio over alphanumerics, spaces
+ignored). An arXiv id → arXiv HTML path, the dropped PDF stays `original.pdf`. Title/authors/year
+come from S2, else the arXiv API, else the PDF itself — never the file name.
+
+**Conversion fallback**: Claude is skipped or fails (no key, >23.9 MB / >600 pages, refusal, any
+API error) → `PDFTextExtractor` (PDFKit lines with font sizes; running headers/footers and page
+numbers dropped; de-hyphenation; paragraph joining incl. resumption after figures/page breaks;
+headings from size/numbering; captions as `> **Figure n.**`) → `ingestMarkdown`. `contentKind`
+stays `.claudeMarkdown`; `importStatusDetail = Importer.localExtractionDetail`; the text starts with
+a visible "Plain-text extraction" note naming the reason. Refusals: `ClaudeError` carries
+`refusalCategory`/`refusalExplanation` from `stop_details` (`ClaudeError.conversionRefusal`);
+import messages never reuse the chat's "rephrase" wording. `ImportError.noExtractableText` when both fail.
+
+**Dedupe**: `original.sha256` sidecar per paper (`PaperStore.pdfSHA256` / `recordPDFHash`, computed
+lazily for old papers). After a PDF is copied, and again after identity resolution (PDF, DOI or
+arXiv metadata), papers with the same SHA-256, arXiv base id or DOI are folded: a new paper with
+no text and no user data is deleted in favour of an existing one with text/user data/work in
+flight (`Importer.onRedirect` → `AppCommands.redirect` moves the selection and flashes "already in
+your library"); redundant *failed, empty* copies are deleted in favour of the one being processed.
+Papers with notes, tags, a status, highlights or chats are never deleted.
+
+**Reprocess** (`Importer.reprocess`, `canReprocess`; library context menu + Paper ▸ Reprocess):
+reruns the pipeline for a ready or failed paper, re-identifying it (a PDF's trusted arXiv id wins
+over a stored one), never reusing the saved Claude conversion (falls back to it if Claude fails
+again). Notes/highlights/chats are untouched; highlights re-anchor via their quote.
+
+**Store**: `PaperStore.storeURL` = `~/Library/Application Support/Paperreads/library.store`, opened by
+`LibraryContainer.make()` (also given to the Settings scene). Before opening, if it doesn't exist
+and `Application Support/default.store` does and is ours (read-only SQLite check: `Z_PRIMARYKEY`
+entities exactly ours + history tables, `ZPAPER` has our columns), `default.store`, `-wal`, `-shm`
+are moved (rolled back on partial failure). A foreign `default.store` is never touched.
+`AppCommands.launch` registers the container with `NotesFiles`.
+
+## 12. Integration notes (ingest × PDF import)
+
+- **Abstract shown once.** Ingest keeps the abstract as the body's first section (`Abstract`).
+  `ReaderHeader` hides its "Abstract" toggle when the first block's section is `Abstract`, and
+  `ChatEngine.buildSystem` adds the separate `## Abstract` only when no block carries that
+  section. `IngestResult.abstract` / `Paper.abstractText` are still filled.
+- **Degraded text notice.** A ready paper whose `importStatusDetail` is
+  `Importer.localExtractionDetail` or starts with "Text incomplete" shows that detail under the
+  title with a Reprocess button. `ImportFailedView` offers Reprocess next to Retry.
+- **Existing papers** imported before §10 keep their old content (broken figure URLs, missing
+  boxes) until Reprocessed; for arXiv papers Reprocess costs no Claude call.
+- **Equations inside paragraphs** (tcolorbox content) split the paragraph: text after a display
+  equation stays after it (`splitParagraphAround` in ingest.js).
+- **Undefined author macros** (e.g. `\E`) left in LaTeXML alttext: `katexHTML` retries with each
+  undefined letters-only macro defined as `\operatorname{name}` instead of showing raw TeX.
+- `NotesFiles.allSnapshots`' last-resort container opens `PaperStore.storeURL`, never
+  `default.store`.
+- Harness: `INGEST_CHECK_DIR` (scratch/cache, default `$TMPDIR/paperreads-ingest-check`) and
+  `INGEST_CHECK_WEB` (Web dir under test, e.g. the built app's `Contents/Resources/Web`).

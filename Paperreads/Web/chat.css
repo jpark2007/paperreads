@@ -47,6 +47,8 @@ body {
 .turn.assistant .body { color: var(--ink); }
 
 .body.prose { font-size: inherit; }
+/* a message body ends flush (common.css only trims trailing margins inside framed containers) */
+.body.prose > :last-child { margin-bottom: 0; }
 .prose h1 { font-size: 1.24em; margin: 1.3em 0 0.5em; }
 .prose h2 { font-size: 1.14em; margin: 1.3em 0 0.45em; }
 .prose h3 { font-size: 1.04em; margin: 1.1em 0 0.4em; }

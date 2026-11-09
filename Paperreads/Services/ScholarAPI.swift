@@ -91,6 +91,10 @@ struct S2MatchPage: Codable {
     var data: [S2MatchResult]?
 }
 
+struct S2PaperMatchPage: Codable {
+    var data: [S2Paper]?
+}
+
 enum ScholarError: LocalizedError {
     case notFound
     case rateLimited
@@ -170,6 +174,24 @@ enum ScholarAPI {
         }
     }
 
+    /// GET /paper/search/match?query={title} with the full paper fields (externalIds etc.).
+    /// Returns nil when S2 has no match. The caller must still compare titles: the endpoint
+    /// always returns its best guess.
+    static func matchPaper(title: String) async throws -> S2Paper? {
+        let q = title.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !q.isEmpty else { return nil }
+        let url = try makeURL(path: "/paper/search/match",
+                              query: [URLQueryItem(name: "query", value: String(q.prefix(300))),
+                                      URLQueryItem(name: "fields", value: paperFields)])
+        do {
+            let data = try await request(url)
+            let page = try decode(S2PaperMatchPage.self, from: data)
+            return page.data?.first(where: { ($0.paperId ?? "").isEmpty == false })
+        } catch ScholarError.notFound {
+            return nil
+        }
+    }
+
     // MARK: Plumbing
 
     private static func encodeID(_ identifier: String) throws -> String {
@@ -221,5 +243,163 @@ enum ScholarAPI {
     private static func decode<T: Decodable>(_ type: T.Type, from data: Data) throws -> T {
         do { return try JSONDecoder().decode(T.self, from: data) }
         catch { throw ScholarError.decoding }
+    }
+}
+
+
+// MARK: - arXiv API
+
+/// One entry of the arXiv Atom API (`export.arxiv.org/api/query`).
+struct ArxivEntry: Equatable, Sendable {
+    /// Versioned id, e.g. "2511.18397v1" or "hep-th/9901001v2".
+    var id: String
+    var title: String
+    var authors: [String]
+    var year: Int?
+    var summary: String
+    var doi: String?
+}
+
+/// Thin client for the arXiv query API, used to identify dropped PDFs by title and to fill
+/// metadata when Semantic Scholar is unavailable. arXiv asks clients to leave 3 s between calls.
+enum ArxivAPI {
+    static let base = "https://export.arxiv.org/api/query"
+
+    /// Title search: an exact phrase query first, then (if that finds nothing) all title words.
+    static func search(title: String, maxResults: Int = 3) async throws -> [ArxivEntry] {
+        let words = TitleMatch.words(title).filter { $0.count > 1 || $0.first?.isNumber == true }
+        guard words.count >= 2 else { return [] }
+        let limited = Array(words.prefix(24))
+        let phrase = "ti:\"" + limited.joined(separator: " ") + "\""
+        let hits = try await query(phrase, maxResults: maxResults)
+        if !hits.isEmpty { return hits }
+        // Stop words and punctuation can defeat a phrase query; fall back to an AND of the
+        // longest distinctive words.
+        let distinctive = Array(Set(limited.filter { $0.count >= 4 })).sorted { $0.count > $1.count }.prefix(10)
+        guard distinctive.count >= 2 else { return [] }
+        return try await query(distinctive.map { "ti:\($0)" }.joined(separator: " AND "), maxResults: maxResults)
+    }
+
+    /// Metadata for one id (version optional). Nil if arXiv has no such paper.
+    static func entry(id: String) async throws -> ArxivEntry? {
+        guard ArxivID.isValid(id) else { return nil }
+        guard var comps = URLComponents(string: base) else { return nil }
+        comps.queryItems = [URLQueryItem(name: "id_list", value: id),
+                            URLQueryItem(name: "max_results", value: "1")]
+        guard let url = comps.url else { return nil }
+        let entries = try await fetch(url)
+        let wanted = ArxivID.stripVersion(id)
+        return entries.first { ArxivID.stripVersion($0.id) == wanted }
+    }
+
+    private static func query(_ searchQuery: String, maxResults: Int) async throws -> [ArxivEntry] {
+        guard var comps = URLComponents(string: base) else { return [] }
+        comps.queryItems = [URLQueryItem(name: "search_query", value: searchQuery),
+                            URLQueryItem(name: "start", value: "0"),
+                            URLQueryItem(name: "max_results", value: String(max(1, min(maxResults, 10))))]
+        // URLComponents leaves "+" unescaped, which arXiv would read as a space; ids and words
+        // never contain one, but be strict anyway.
+        comps.percentEncodedQuery = comps.percentEncodedQuery?.replacingOccurrences(of: "+", with: "%2B")
+        guard let url = comps.url else { return [] }
+        return try await fetch(url)
+    }
+
+    private static func fetch(_ url: URL) async throws -> [ArxivEntry] {
+        try await ArxivThrottle.shared.waitForTurn()
+        let (data, _) = try await HTTP.get(url, maxBytes: HTTP.maxJSONBytes,
+                                           headers: ["Accept": "application/atom+xml"])
+        return parse(data)
+    }
+
+    /// Parses an Atom feed. Entries without a valid arXiv id (e.g. the API's error entry) are dropped.
+    static func parse(_ data: Data) -> [ArxivEntry] {
+        let delegate = ArxivAtomParser()
+        let parser = XMLParser(data: data)
+        parser.shouldProcessNamespaces = true
+        parser.shouldResolveExternalEntities = false
+        parser.delegate = delegate
+        _ = parser.parse()
+        return delegate.entries
+    }
+}
+
+/// Spaces arXiv API requests (arXiv's terms ask for one request every 3 seconds).
+private actor ArxivThrottle {
+    static let shared = ArxivThrottle()
+    private let minimumSpacing: Duration = .seconds(3)
+    private var nextSlot: ContinuousClock.Instant = .now
+
+    func waitForTurn() async throws {
+        let clock = ContinuousClock()
+        let now = clock.now
+        let slot = max(now, nextSlot)
+        nextSlot = slot + minimumSpacing
+        if slot > now { try await clock.sleep(until: slot, tolerance: .milliseconds(100)) }
+    }
+}
+
+private final class ArxivAtomParser: NSObject, XMLParserDelegate {
+    private static let atom = "http://www.w3.org/2005/Atom"
+    private static let arxivNS = "http://arxiv.org/schemas/atom"
+
+    private(set) var entries: [ArxivEntry] = []
+    private var inEntry = false
+    private var inAuthor = false
+    private var text = ""
+    private var id = "", title = "", summary = "", published = "", doi = ""
+    private var authors: [String] = []
+    private var authorName = ""
+
+    func parser(_ parser: XMLParser, didStartElement elementName: String, namespaceURI: String?,
+                qualifiedName qName: String?, attributes attributeDict: [String: String] = [:]) {
+        text = ""
+        switch (namespaceURI, elementName) {
+        case (Self.atom?, "entry"):
+            inEntry = true
+            id = ""; title = ""; summary = ""; published = ""; doi = ""; authors = []
+        case (Self.atom?, "author") where inEntry:
+            inAuthor = true
+            authorName = ""
+        default:
+            break
+        }
+    }
+
+    func parser(_ parser: XMLParser, foundCharacters string: String) {
+        if inEntry, text.utf16.count < 200_000 { text += string }
+    }
+
+    func parser(_ parser: XMLParser, didEndElement elementName: String, namespaceURI: String?,
+                qualifiedName qName: String?) {
+        guard inEntry else { return }
+        let value = text.split(whereSeparator: { $0.isWhitespace }).joined(separator: " ")
+        switch (namespaceURI, elementName) {
+        case (Self.atom?, "id"): id = value
+        case (Self.atom?, "title"): title = value
+        case (Self.atom?, "summary"): summary = value
+        case (Self.atom?, "published"): published = value
+        case (Self.atom?, "name") where inAuthor: authorName = value
+        case (Self.atom?, "author"):
+            if !authorName.isEmpty { authors.append(authorName) }
+            inAuthor = false
+        case (Self.arxivNS?, "doi"): doi = value
+        case (Self.atom?, "entry"):
+            inEntry = false
+            if let parsed = Self.arxivID(fromAbsURL: id), !title.isEmpty {
+                let year = Int(published.prefix(4)).flatMap { (1900...2200).contains($0) ? $0 : nil }
+                entries.append(ArxivEntry(id: parsed, title: title, authors: authors, year: year,
+                                          summary: summary, doi: doi.isEmpty ? nil : DOIParser.normalize(doi)))
+            }
+        default:
+            break
+        }
+        text = ""
+    }
+
+    /// "http://arxiv.org/abs/2511.18397v1" → "2511.18397v1".
+    private static func arxivID(fromAbsURL s: String) -> String? {
+        guard let r = s.range(of: "/abs/") else { return nil }
+        let rest = String(s[r.upperBound...])
+        return ArxivID.fromPathRemainder(rest)
     }
 }

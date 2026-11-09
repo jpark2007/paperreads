@@ -88,7 +88,7 @@
   /** Title text with math rendered as its Unicode MathML text (readable natively). */
   function unicodeText(el) {
     const c = el.cloneNode(true);
-    c.querySelectorAll('.ltx_note, .ltx_role_footnote, sup.ltx_note_mark, .ltx_tag').forEach((n) => n.remove());
+    c.querySelectorAll('.ltx_note, .ltx_role_footnote, sup.ltx_note_mark, .ltx_tag, .ltx_pubnotes, .ltx_role_thanks, annotation, annotation-xml').forEach((n) => n.remove());
     return collapse(c.textContent);
   }
 
@@ -230,10 +230,9 @@
       const u = new URL(base);
       const baseEl = doc.querySelector('base[href]');
       if (baseEl) return new URL(baseEl.getAttribute('href'), u).href;
-      // arxiv.org/html/<id> serves assets relative to "<id>/": unless the last segment is
-      // clearly a file (foo.html), treat it as a directory. arXiv ids contain dots.
-      const last = u.pathname.split('/').pop();
-      if (last && !/\.(x?html?|php|aspx?)$/i.test(last) && !u.pathname.endsWith('/')) u.pathname += '/';
+      // Resolve exactly as a browser showing the page would. arXiv's image paths already
+      // carry the versioned id ("2006.11239v2/images/x.png" on /html/2006.11239), so treating
+      // the last segment as a directory produced /html/<id>/<id>v2/… — a 404 for every figure.
       u.hash = '';
       u.search = '';
       return u.href;
@@ -251,13 +250,283 @@
     } catch (_) { return false; }
   }
 
+  // ---------------------------------------------------------------------------
+  // SVG pictures (tcolorbox boxes, TikZ diagrams, pgfplots)
+  // ---------------------------------------------------------------------------
+
+  const INVISIBLE_MATH_RE = /[⁡-⁤​]/g;
+
+  /** Readable text of a subtree: MathML as its presentation text (no TeX annotation). */
+  function plainText(el) {
+    const c = el.cloneNode(true);
+    c.querySelectorAll('annotation, annotation-xml, script, style').forEach((n) => n.remove());
+    return collapse(c.textContent.replace(INVISIBLE_MATH_RE, ''));
+  }
+
+  function svgLength(svg, attr, vbIndex) {
+    const v = parseFloat(svg.getAttribute(attr));
+    if (isFinite(v) && v > 0) return v;
+    const vb = (svg.getAttribute('viewBox') || '').trim().split(/[\s,]+/).map(parseFloat);
+    return vb.length === 4 && isFinite(vb[vbIndex]) ? vb[vbIndex] : 0;
+  }
+
+  /**
+   * A picture is a "box" (tcolorbox, framed theorem, mdframed …) when it carries at most a few
+   * foreignObjects and the widest spans most of the picture: its content is running text,
+   * not labels placed on a drawing.
+   */
+  function isBoxPicture(svg, fos) {
+    if (!fos.length || fos.length > 4) return false;
+    const width = svgLength(svg, 'width', 2);
+    const widest = Math.max.apply(null, fos.map((f) => parseFloat(f.getAttribute('width')) || 0));
+    if (!(width > 0)) return true;
+    if (widest < 0.6 * width) return false;
+    // drawn text outside the foreignObjects means it is a diagram with a wide label
+    const drawnText = Array.from(svg.querySelectorAll('text')).some((t) => !t.closest('foreignObject') && collapse(t.textContent));
+    return !drawnText;
+  }
+
+  /** LaTeXML renders block structure inside inline contexts as spans; restore it. */
+  function blockifySpans(root) {
+    const map = [
+      ['span.ltx_figure', 'figure'],
+      ['span.ltx_caption', 'figcaption'],
+      ['span.ltx_para', 'div'],
+      ['span.ltx_p', 'p'],
+      ['span.ltx_theorem, span.ltx_proof', 'div'],
+      ['span.ltx_itemize', 'ul'],
+      ['span.ltx_enumerate', 'ol'],
+      ['span.ltx_item', 'li'],
+      ['span.ltx_listing', 'div'],
+    ];
+    map.forEach(([sel, tag]) => {
+      Array.from(root.querySelectorAll(sel)).forEach((el) => { if (el.isConnected) rename(el, tag); });
+    });
+    // minipages / logical blocks that hold paragraphs become plain divs
+    Array.from(root.querySelectorAll('span.ltx_minipage, span.ltx_inline-logical-block, span.ltx_inline-block'))
+      .reverse()
+      .forEach((el) => {
+        if (el.isConnected && el.querySelector('p, div, figure, ul, ol, table')) rename(el, 'div');
+      });
+  }
+
+  /** Replaces `node` (inside `root`) with `repl`; a block replacement is hoisted out of a <p>. */
+  function placeBlock(node, repl, root) {
+    let target = node;
+    // the picture usually sits alone in a span.ltx_inline-block wrapper
+    const wrap = node.parentElement;
+    if (wrap && wrap !== root && wrap.localName === 'span' && hasClass(wrap, 'ltx_inline-block') &&
+        Array.from(wrap.childNodes).every((c) => c === node || (c.nodeType === 3 && !c.data.trim()))) {
+      target = wrap;
+    }
+    const p = target.parentElement && target.parentElement.closest('p, span.ltx_p');
+    if (p && root.contains(p) && p !== root) {
+      p.parentNode.insertBefore(repl, p.nextSibling);
+      target.remove();
+    } else {
+      target.parentNode.replaceChild(repl, target);
+    }
+  }
+
+  function pictureToBox(svg, fos, root) {
+    const doc = svg.ownerDocument;
+    const box = doc.createElement('div');
+    box.className = 'box';
+    const id = svg.getAttribute('id');
+    if (id) box.setAttribute('id', id);
+    fos.forEach((fo, i) => {
+      const content = fo.querySelector('.ltx_foreignobject_content') || fo;
+      const holder = doc.createElement('div');
+      while (content.firstChild) holder.appendChild(content.firstChild);
+      blockifySpans(holder);
+      const text = plainText(holder);
+      if (!text && !holder.querySelector('img, math, svg')) return;
+      const isTitle = i === 0 && fos.length >= 2 && text.split(' ').length <= 25 &&
+        !holder.querySelector('math[display="block"], table, img, figure, ul, ol');
+      if (isTitle) {
+        const title = doc.createElement('p');
+        title.className = 'box-title';
+        const ps = holder.querySelectorAll('p');
+        if (ps.length === 1) {
+          while (ps[0].firstChild) title.appendChild(ps[0].firstChild);
+        } else {
+          holder.querySelectorAll('p, div, figure, figcaption').forEach((n) => {
+            n.parentNode.insertBefore(doc.createTextNode(' '), n);
+            unwrap(n);
+          });
+          while (holder.firstChild) title.appendChild(holder.firstChild);
+        }
+        box.appendChild(title);
+        return;
+      }
+      // bare inline content (no paragraph structure) gets a paragraph so it is a block
+      if (!holder.querySelector('p, div, figure, ul, ol, table, h1, h2, h3, h4, h5, h6')) {
+        const p = doc.createElement('p');
+        while (holder.firstChild) p.appendChild(holder.firstChild);
+        holder.appendChild(p);
+      }
+      box.appendChild(holder);
+    });
+    if (!box.childNodes.length) { placeBlock(svg, doc.createTextNode(''), root); return; }
+    placeBlock(svg, box, root);
+  }
+
+  /** foreignObject label → SVG <text> drawn where the label was (no HTML inside an image). */
+  function labelToText(fo, xdoc) {
+    const text = plainText(fo);
+    if (!text) return null;
+    const width = parseFloat(fo.getAttribute('width')) || 0;
+    const height = parseFloat(fo.getAttribute('height')) || 0;
+    const fsMatch = /font-size:\s*([\d.]+)pt/.exec(fo.getAttribute('style') || '');
+    let fs = fsMatch ? parseFloat(fsMatch[1]) : 10;
+    if (!(fs > 0 && fs < 100)) fs = 10;
+    const fgMatch = /--ltx-fg-color:\s*(#[0-9a-fA-F]{3,8})/.exec(fo.innerHTML);
+    const t = xdoc.createElementNS('http://www.w3.org/2000/svg', 'text');
+    const tr = fo.getAttribute('transform');
+    if (tr && /^[\w\s().,+\-eE]*$/.test(tr)) t.setAttribute('transform', tr);
+    t.setAttribute('font-size', String(fs));
+    t.setAttribute('font-family', 'ui-serif, Georgia, serif');
+    t.setAttribute('stroke', 'none');
+    if (fgMatch) t.setAttribute('fill', fgMatch[1]);
+    const x = parseFloat(fo.getAttribute('x')) || 0;
+    const y = parseFloat(fo.getAttribute('y')) || 0;
+    // wrap only when the box is clearly taller than one line
+    const lines = [];
+    if (height > fs * 1.9 && width > 0) {
+      const maxChars = Math.max(6, Math.floor(width / (fs * 0.5)));
+      let line = '';
+      text.split(' ').forEach((w) => {
+        if (line && (line + ' ' + w).length > maxChars) { lines.push(line); line = w; } else line = line ? line + ' ' + w : w;
+      });
+      if (line) lines.push(line);
+    } else {
+      lines.push(text);
+    }
+    lines.forEach((ln, i) => {
+      const span = xdoc.createElementNS('http://www.w3.org/2000/svg', 'tspan');
+      span.setAttribute('x', String(x));
+      span.setAttribute('y', String(+(y + fs * (0.85 + i * 1.2)).toFixed(2)));
+      span.textContent = ln;
+      t.appendChild(span);
+    });
+    return t;
+  }
+
+  function pictureToImage(svg, fos, root) {
+    const doc = svg.ownerDocument;
+    const labels = fos.map(plainText).filter(Boolean);
+    const width = svgLength(svg, 'width', 2);
+    const height = svgLength(svg, 'height', 3);
+    let url = null;
+    if (width >= 4 && height >= 4) {
+      try {
+        const clean = P.buildSafeSVG(svg, labelToText);
+        if (!clean.getAttribute('viewBox')) clean.setAttribute('viewBox', '0 0 ' + width + ' ' + height);
+        url = P.svgDataURL(clean);
+      } catch (_) { url = null; }
+    }
+    if (!url) {
+      // too large / degenerate: keep any labels as text so nothing is silently lost
+      const span = doc.createElement('span');
+      span.textContent = labels.join(' · ');
+      svg.parentNode.replaceChild(span, svg);
+      return;
+    }
+    const img = doc.createElement('img');
+    img.setAttribute('src', url);
+    img.setAttribute('alt', labels.join(' · ').slice(0, 1000));
+    img.className = 'diagram';
+    const id = svg.getAttribute('id');
+    if (id) img.setAttribute('id', id);
+    const wrap = svg.parentElement;
+    if (wrap && wrap.localName === 'span' && hasClass(wrap, 'ltx_inline-block') &&
+        Array.from(wrap.childNodes).every((c) => c === svg || (c.nodeType === 3 && !c.data.trim()))) {
+      wrap.parentNode.replaceChild(img, wrap);
+    } else {
+      svg.parentNode.replaceChild(img, svg);
+    }
+  }
+
+  /**
+   * LaTeXML pictures: tcolorbox-style boxes become div.box with their text (theorems, abstracts
+   * and prompts drawn in boxes); everything else becomes a sanitized SVG image.
+   */
+  function convertPictures(root) {
+    // Outermost pictures first; a box's content can itself hold pictures, which surface as
+    // outermost on the next round.
+    for (let round = 0; round < 8; round++) {
+      const svgs = Array.from(root.querySelectorAll('svg')).filter((s) => !(s.parentElement && s.parentElement.closest('svg')));
+      if (!svgs.length) return;
+      svgs.forEach((svg) => {
+        if (!svg.isConnected) return;
+        const fos = Array.from(svg.querySelectorAll('foreignObject')).filter((f) => !(f.parentElement && f.parentElement.closest('foreignObject')));
+        if (fos.length && isBoxPicture(svg, fos)) pictureToBox(svg, fos, root);
+        else pictureToImage(svg, fos, root);
+      });
+    }
+  }
+
+  /**
+   * Turns a LaTeXML abstract into `div.abstract > h2 "Abstract" + paragraphs` and makes sure it
+   * comes before the first section. The h2 makes "Abstract" the section of its blocks.
+   */
+  function prepareAbstract(absEl, root) {
+    const doc = absEl.ownerDocument;
+    Array.from(absEl.querySelectorAll('.ltx_title_abstract, h1, h2, h3, h4, h5, h6')).forEach((h) => {
+      if (/^\s*abstract\s*[.:]?\s*$/i.test(h.textContent) || hasClass(h, 'ltx_title_abstract')) h.remove();
+    });
+    const div = absEl.localName === 'div' ? absEl : rename(absEl, 'div');
+    div.classList.add('abstract');
+    const h = doc.createElement('h2');
+    h.textContent = 'Abstract';
+    div.insertBefore(h, div.firstChild);
+    // First thing in the body (title/authors are removed later; front-matter notes such as
+    // permission statements follow it).
+    if (div.parentNode !== root || root.firstElementChild !== div) {
+      const prevAbs = Array.from(root.children).filter((c) => c !== div && hasClass(c, 'abstract'));
+      const after = prevAbs.length ? prevAbs[prevAbs.length - 1].nextSibling : root.firstChild;
+      root.insertBefore(div, after);
+    }
+  }
+
+  /**
+   * Replaces `node` (somewhere inside paragraph `p`) with the block content `frag`, placed
+   * between `p` (holding what came before `node`) and a new paragraph holding what came after.
+   */
+  function splitParagraphAround(p, node, frag) {
+    const doc = p.ownerDocument;
+    let tail = null;
+    if (p.lastChild && !(p.lastChild === node)) {
+      const range = doc.createRange();
+      range.setStartAfter(node);
+      range.setEndAfter(p.lastChild);
+      const rest = range.extractContents();
+      tail = p.cloneNode(false);
+      tail.removeAttribute('id');
+      tail.appendChild(rest);
+    }
+    node.remove();
+    const hasContent = (el) => !!(collapse(el.textContent) || el.querySelector('img, math, svg, .m'));
+    const parent = p.parentNode;
+    const next = p.nextSibling;
+    parent.insertBefore(frag, next);
+    if (tail && hasContent(tail)) parent.insertBefore(tail, next);
+    if (!hasContent(p)) {
+      if (p.getAttribute('id') && tail && tail.parentNode && !tail.getAttribute('id')) tail.setAttribute('id', p.getAttribute('id'));
+      p.remove();
+    }
+  }
+
   /** Converts LaTeXML equation tables into div.eq rows (one per numbered/leaf row). */
   function convertEquationTables(root) {
     const doc = root.ownerDocument;
-    const tables = Array.from(root.querySelectorAll('table.ltx_equation, table.ltx_equationgroup, table.ltx_eqn_table'));
+    // Inside inline contexts (e.g. tcolorbox pictures) LaTeXML writes the same structure with
+    // spans: span.ltx_eqn_table > span > span.ltx_eqn_row > span.ltx_eqn_cell.
+    const tables = Array.from(root.querySelectorAll(
+      'table.ltx_equation, table.ltx_equationgroup, table.ltx_eqn_table, span.ltx_eqn_table, span.ltx_equationgroup'));
     tables.forEach((table) => {
       if (!table.isConnected || !root.contains(table)) return;
-      const rows = Array.from(table.querySelectorAll('tr')).filter((tr) => !tr.querySelector('tr'));
+      const rows = Array.from(table.querySelectorAll('tr, .ltx_eqn_row')).filter((tr) => !tr.querySelector('tr, .ltx_eqn_row'));
       const out = [];
       rows.forEach((tr) => {
         const tagEl = tr.querySelector('.ltx_tag_equation, .ltx_eqn_eqno .ltx_tag');
@@ -279,7 +548,8 @@
         const tex = pieces.filter(Boolean).join(' ').trim();
         const body = tr.parentNode;
         const rowId = tr.getAttribute('id') ||
-          (body && body.localName === 'tbody' && body.firstElementChild === tr ? body.getAttribute('id') || '' : '');
+          (body && (body.localName === 'tbody' || body.localName === 'span') && body !== table &&
+            body.firstElementChild === tr ? body.getAttribute('id') || '' : '');
         if (!tex) {
           if (number && out.length && !out[out.length - 1].number) out[out.length - 1].number = number;
           return;
@@ -305,11 +575,11 @@
       if (out.length > 1 && table.getAttribute('id') && frag.firstChild && !frag.firstChild.getAttribute('id')) {
         frag.firstChild.setAttribute('id', table.getAttribute('id'));
       }
-      // a div.eq may not live inside <p>; hoist out of a paragraph if needed
+      // a div.eq may not live inside <p>: split the paragraph around the equation so the text
+      // after it (e.g. "… satisfies [eq] so any two …") stays after it
       const p = table.closest('p');
       if (p && root.contains(p)) {
-        p.parentNode.insertBefore(frag, p.nextSibling);
-        table.remove();
+        splitParagraphAround(p, table, frag);
       } else {
         table.parentNode.replaceChild(frag, table);
       }
@@ -500,20 +770,25 @@
     authors = authors.slice(0, 200);
 
     // --- structural conversion ---
+    convertPictures(root);
     convertEquationTables(root);
     convertInlineMath(root);
 
     let abstract = '';
-    const absEl = root.querySelector('.ltx_abstract');
-    if (absEl) {
+    const absEls = Array.from(root.querySelectorAll('.ltx_abstract')).filter((a) => !a.parentElement || !a.parentElement.closest('.ltx_abstract'));
+    absEls.forEach((absEl, i) => {
       const c = absEl.cloneNode(true);
       c.querySelectorAll('.ltx_title, .ltx_title_abstract, h1, h2, h3, h4, h5, h6, .ltx_note').forEach((n) => n.remove());
       const paras = Array.from(c.querySelectorAll('p'));
-      abstract = paras.length ? paras.map((p) => P.blockText(p)).filter(Boolean).join('\n\n') : P.blockText(c);
-    }
+      const text = paras.length ? paras.map((p) => P.blockText(p)).filter(Boolean).join('\n\n') : P.blockText(c);
+      if (text && i === 0) abstract = text;
+      // The abstract stays in the body as the first section (labelled "Abstract"), so the
+      // reader shows it and blocks.json — Claude's view of the paper — includes it.
+      prepareAbstract(absEl, root);
+    });
 
     // drop the header block (rendered natively) and page chrome
-    removeAll(root, '.ltx_title_document, .ltx_authors, .ltx_abstract');
+    removeAll(root, '.ltx_title_document, .ltx_authors');
     convertFootnotes(root);
     removeAll(root, NOISE_SELECTORS);
     // any other LaTeXML role noise, except bibliography numbers and display roles
@@ -545,6 +820,10 @@
     const sel = 'p, div, span, li, figure, figcaption, blockquote, cite, em, strong, i, b, sub, sup';
     let changed = true;
     let guard = 0;
+    // layout tables with nothing in them (LaTeXML spacer tabulars) only add blank space
+    Array.from(container.querySelectorAll('table')).reverse().forEach((t) => {
+      if (t.isConnected && !t.querySelector('img, span.m, br') && collapse(t.textContent) === '') t.remove();
+    });
     while (changed && guard++ < 4) {
       changed = false;
       Array.from(container.querySelectorAll(sel)).reverse().forEach((el) => {
@@ -687,31 +966,47 @@
     figureQuotes(container);
     markTables(container);
 
-    // Abstract: content under a heading matching /abstract/i, up to the next heading.
-    // It is removed from the body (rendered natively), mirroring the arXiv path.
+    // Abstract: content under a heading matching /abstract/i, up to the next heading, or a
+    // "**Abstract.** text…" run-in paragraph. Like the arXiv path it stays in the body as the
+    // first section (div.abstract > h2 "Abstract"), so the reader shows it and blocks.json has it.
     let abstract = '';
+    const doc = container.ownerDocument;
+    const box = doc.createElement('div');
+    box.className = 'abstract';
+    const label = doc.createElement('h2');
+    label.textContent = 'Abstract';
+    box.appendChild(label);
     const absHead = Array.from(container.querySelectorAll('h2, h3, h4')).find((h) => /^\s*(\d+[.)]?\s*)?abstract\b/i.test(headingText(h)));
     if (absHead) {
       const parts = [];
-      const remove = [absHead];
+      const move = [];
       for (let n = absHead.nextElementSibling; n && !/^h[1-4]$/.test(n.localName); n = n.nextElementSibling) {
         const t = P.blockText(n);
         if (t) parts.push(t);
-        remove.push(n);
+        move.push(n);
       }
       abstract = parts.join('\n\n');
-      remove.forEach((n) => n.remove());
+      absHead.parentNode.replaceChild(box, absHead);
+      move.forEach((n) => box.appendChild(n));
     } else {
-      // "**Abstract.** text…" run-in paragraph
       const p = Array.from(container.querySelectorAll('p')).slice(0, 6).find((x) => {
         const lead = x.firstElementChild;
         return lead && /^(strong|b|em|i)$/.test(lead.localName) && /^\s*abstract\s*[.:—–-]?\s*$/i.test(lead.textContent) && x.firstChild === lead;
       });
       if (p) {
         p.firstElementChild.remove();
-        abstract = P.blockText(p).replace(/^[.:—–-]\s*/, '');
-        p.remove();
+        // drop the separator left after the run-in label
+        const first = p.firstChild;
+        if (first && first.nodeType === 3) first.data = first.data.replace(/^\s*[.:—–-]?\s*/, '');
+        abstract = P.blockText(p);
+        p.parentNode.replaceChild(box, p);
+        box.appendChild(p);
       }
+    }
+    if (box.parentNode && box.parentNode.firstChild !== box) {
+      // first in the body (a stray front-matter paragraph may precede it)
+      const host = box.parentNode;
+      host.insertBefore(box, host.firstChild);
     }
     return finish(title, authors, abstract, container);
   }

@@ -144,7 +144,11 @@ private struct ReaderTextContent: View {
 private struct ReaderHeader: View {
     let paper: Paper
     @EnvironmentObject private var app: AppCommands
+    @Environment(\.modelContext) private var context
     @State private var showAbstract = false
+    /// True when the clean text already opens with an "Abstract" section (ingest keeps it in
+    /// the body), so the header toggle would only duplicate it.
+    @State private var bodyHasAbstract = false
 
     private var meta: String {
         var parts: [String] = []
@@ -160,7 +164,25 @@ private struct ReaderHeader: View {
     }
 
     private var abstract: String {
-        paper.abstractText.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !bodyHasAbstract else { return "" }
+        return paper.abstractText.trimmingCharacters(in: .whitespacesAndNewlines)
+    }
+
+    /// Detail shown under the title for a ready paper whose text is degraded (plain-text
+    /// fallback or a truncated conversion), with a Reprocess action.
+    private var degradedDetail: String? {
+        guard paper.importState == .ready, let d = paper.importStatusDetail, !d.isEmpty else { return nil }
+        if d == Importer.localExtractionDetail || d.hasPrefix("Text incomplete") { return d }
+        return nil
+    }
+
+    private func refreshBodyHasAbstract() {
+        guard paper.importState == .ready else { bodyHasAbstract = false; return }
+        let first = PaperStore.readBlocks(paper.id).min(by: { $0.b < $1.b })
+        bodyHasAbstract = first.map {
+            $0.section.trimmingCharacters(in: .whitespacesAndNewlines)
+                .caseInsensitiveCompare("Abstract") == .orderedSame
+        } ?? false
     }
 
     var body: some View {
@@ -179,6 +201,20 @@ private struct ReaderHeader: View {
                     .foregroundStyle(Theme.muted)
                     .lineLimit(2)
                     .textSelection(.enabled)
+            }
+
+            if let detail = degradedDetail {
+                HStack(alignment: .firstTextBaseline, spacing: Theme.Space.s) {
+                    Text(detail)
+                        .font(.rounded(12))
+                        .foregroundStyle(Theme.muted)
+                        .fixedSize(horizontal: false, vertical: true)
+                    if Importer.shared.canReprocess(paper) {
+                        Button("Reprocess") { app.reprocess(paper, context: context) }
+                            .buttonStyle(.text)
+                            .help("Rebuild the clean text (a PDF is converted by Claude again)")
+                    }
+                }
             }
 
             HStack(alignment: .center, spacing: Theme.Space.m) {
@@ -225,7 +261,9 @@ private struct ReaderHeader: View {
         .padding(.top, Theme.Space.l)
         .padding(.bottom, Theme.Space.l)
         .frame(maxWidth: .infinity, alignment: .leading)
-        .onChange(of: paper.id) { showAbstract = false }
+        .onAppear { refreshBodyHasAbstract() }
+        .onChange(of: paper.id) { showAbstract = false; refreshBodyHasAbstract() }
+        .onChange(of: paper.importState) { refreshBodyHasAbstract() }
     }
 
     private var sourceURL: URL? {
@@ -408,6 +446,11 @@ private struct ImportFailedView: View {
             HStack(spacing: Theme.Space.m) {
                 Button("Retry") { Importer.shared.retry(paper, context: context) }
                     .buttonStyle(.pill)
+                if Importer.shared.canReprocess(paper) {
+                    Button("Reprocess") { app.reprocess(paper, context: context) }
+                        .buttonStyle(.text)
+                        .help("Identify the paper again and rebuild its text from scratch")
+                }
                 if paper.hasPDF {
                     Button("View PDF") { app.readerMode = .pdf }
                         .buttonStyle(.text)

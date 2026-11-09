@@ -66,8 +66,17 @@ body {
 
 .prose { color: var(--ink); hyphens: auto; -webkit-hyphens: auto; overflow-wrap: break-word; }
 
-.prose p { margin: 0 0 1em; }
-.prose p:last-child { margin-bottom: 0; }
+/* Paragraphs are separated by a clear gap. LaTeXML wraps every paragraph in its own <div>
+   (div > p), so a generic `p:last-child { margin: 0 }` would remove every gap; only the
+   containers that frame their own content trim the trailing margin. */
+.prose p { margin: 0 0 0.9em; }
+.prose li > p:last-child,
+.prose blockquote > p:last-child,
+.prose td p:last-child,
+.prose th p:last-child,
+.prose figcaption p:last-child,
+.prose .box > :last-child > p:last-child,
+.prose .box > p:last-child { margin-bottom: 0; }
 
 .prose h1, .prose h2, .prose h3, .prose h4 {
   font-family: var(--serif);
@@ -242,3 +251,46 @@ code.tex-fallback {
 .prose ul.biblist > li.bibitem { margin: 0 0 0.75em; padding-left: 2.6em; text-indent: -2.6em; }
 .prose ul.biblist > li.bibitem .tag { color: var(--faint); display: inline-block; min-width: 2.6em; text-indent: 0; }
 .prose .ack { color: var(--muted); }
+
+/* Boxed environments (tcolorbox / framed theorems drawn as pictures by LaTeXML): a quiet
+   hairline frame with a small-caps title, no fill. */
+.prose .box {
+  margin: 1.6em 0;
+  padding: 0.95em 1.15em 1.05em;
+  border: 1px solid var(--hairline);
+  border-radius: 6px;
+}
+.prose .box > p.box-title {
+  font-family: var(--rounded);
+  font-size: 0.66em;
+  font-weight: 700;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  line-height: 1.4;
+  color: var(--muted);
+  margin: 0 0 0.75em;
+  hyphens: manual;
+  -webkit-hyphens: manual;
+}
+.prose .box > p.box-title .m { text-transform: none; letter-spacing: 0; }
+.prose .box figure { margin: 1.2em 0 0.4em; }
+
+/* The abstract opens the body under a small-caps label (it is a real h2 so its blocks carry
+   the section "Abstract"). */
+.prose .abstract { margin: 0 0 2.2em; }
+.prose .abstract > h2:first-child {
+  font-family: var(--rounded);
+  font-size: 0.6em;
+  font-weight: 700;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  line-height: 1.4;
+  color: var(--muted);
+  margin: 0 0 0.9em;
+  padding-top: 0;
+  border-top: 0;
+}
+
+/* diagrams (TikZ / pgfplots pictures converted to SVG images) */
+.prose img.diagram { max-width: 100%; height: auto; }
+.prose figure img.diagram { mix-blend-mode: normal; }

@@ -22,11 +22,18 @@ struct ClaudeError: LocalizedError {
     let type: String?
     /// The API's error message, or a local description.
     let message: String
+    /// For `type == "refusal"`: `stop_details.category` (e.g. "cyber", "bio"), when the API sent one.
+    let refusalCategory: String?
+    /// For `type == "refusal"`: `stop_details.explanation`, when present.
+    let refusalExplanation: String?
 
-    init(status: Int? = nil, type: String? = nil, message: String) {
+    init(status: Int? = nil, type: String? = nil, message: String,
+         refusalCategory: String? = nil, refusalExplanation: String? = nil) {
         self.status = status
         self.type = type
         self.message = message
+        self.refusalCategory = refusalCategory
+        self.refusalExplanation = refusalExplanation
     }
 
     var errorDescription: String? {
@@ -55,6 +62,9 @@ struct ClaudeError: LocalizedError {
         var parts: [String] = []
         if let lead { parts.append(lead) }
         if !detail.isEmpty, detail != lead { parts.append(detail) }
+        if type == "refusal", let category = refusalCategory, !category.isEmpty {
+            parts.append("(Refusal category: \(category).)")
+        }
         if parts.isEmpty { parts.append("The Claude request failed.") }
         if let status, lead == nil, type != "refusal" { parts.append("(HTTP \(status))") }
         return parts.joined(separator: " ")
@@ -64,6 +74,37 @@ struct ClaudeError: LocalizedError {
                                         message: "Add your Anthropic API key in Settings (⌘,) to use Claude.")
     static let refusal = ClaudeError(type: "refusal",
                                      message: "Claude declined to respond to this request. Try rephrasing the question.")
+
+    /// A refused PDF conversion. Import wording (never the chat's "rephrase" advice), with the
+    /// API's `stop_details` category/explanation when present.
+    static func conversionRefusal(category: String?, explanation: String?) -> ClaudeError {
+        var message = "Claude declined to convert this PDF."
+        if let e = explanation?.trimmingCharacters(in: .whitespacesAndNewlines), !e.isEmpty {
+            message += " " + String(e.prefix(300))
+        }
+        return ClaudeError(type: "refusal", message: message,
+                           refusalCategory: category?.trimmingCharacters(in: .whitespacesAndNewlines),
+                           refusalExplanation: explanation)
+    }
+
+    var isRefusal: Bool { type == "refusal" }
+}
+
+/// Receives the final message's `stop_details` from the stream (the public stream event
+/// carries only `stop_reason`). Written once by the stream task, read after it finishes.
+final class ClaudeStopDetailsSink: @unchecked Sendable {
+    private let lock = NSLock()
+    private var value: (category: String?, explanation: String?)?
+
+    func set(category: String?, explanation: String?) {
+        lock.lock(); defer { lock.unlock() }
+        value = (category, explanation)
+    }
+
+    var details: (category: String?, explanation: String?)? {
+        lock.lock(); defer { lock.unlock() }
+        return value
+    }
 }
 
 // MARK: - Stream events
@@ -228,6 +269,8 @@ struct MessageAccumulator {
     private(set) var blocks: [Int: [String: Any]] = [:]
     private var partialJSON: [Int: String] = [:]
     private(set) var stopReason: String?
+    /// `stop_details` of the final message (`category`, `explanation`), e.g. on a refusal.
+    private(set) var stopDetails: [String: Any]?
     private(set) var stopSequence: Any?
     private(set) var finished = false
     private(set) var sawMessageStart = false
@@ -320,7 +363,9 @@ struct MessageAccumulator {
             if let delta = obj["delta"] as? [String: Any] {
                 if let r = delta["stop_reason"] as? String { stopReason = r }
                 if let s = delta["stop_sequence"], !(s is NSNull) { stopSequence = s }
+                if let d = delta["stop_details"] as? [String: Any] { stopDetails = d }
             }
+            if let d = obj["stop_details"] as? [String: Any] { stopDetails = d }
             return .none
 
         case "message_stop":
@@ -392,11 +437,16 @@ struct ClaudeClient {
     /// Streams one Messages request. `body` is the JSON object minus model/stream/fallbacks,
     /// which the client adds.
     func stream(body: [String: Any]) -> AsyncThrowingStream<ClaudeStreamEvent, Error> {
+        stream(body: body, stopDetails: nil)
+    }
+
+    /// `stream(body:)`, also reporting the final `stop_details` to `stopDetails`.
+    private func stream(body: [String: Any], stopDetails: ClaudeStopDetailsSink?) -> AsyncThrowingStream<ClaudeStreamEvent, Error> {
         let box = BodyBox(body: body)
         return AsyncThrowingStream { continuation in
             let task = Task {
                 do {
-                    try await Self.run(body: box.body, continuation: continuation)
+                    try await Self.run(body: box.body, continuation: continuation, stopDetails: stopDetails)
                     continuation.finish()
                 } catch {
                     continuation.finish(throwing: Self.normalize(error))
@@ -458,7 +508,8 @@ struct ClaudeClient {
         var lastReported = 0
         var lastReportTime = Date.distantPast
         await onProgress(0)
-        for try await event in stream(body: body) {
+        let details = ClaudeStopDetailsSink()
+        for try await event in stream(body: body, stopDetails: details) {
             try Task.checkCancellation()
             switch event {
             case .textDelta(let t):
@@ -472,7 +523,12 @@ struct ClaudeClient {
             case .thinking:
                 break
             case .done(_, let text, let stopReason):
-                if stopReason == "refusal" { throw ClaudeError.refusal }
+                if stopReason == "refusal" {
+                    // Partial output before a mid-stream refusal is discarded, never presented
+                    // as the paper.
+                    let d = details.details
+                    throw ClaudeError.conversionRefusal(category: d?.category, explanation: d?.explanation)
+                }
                 await onProgress(text.count)
                 let complete = stopReason == nil || stopReason == "end_turn" || stopReason == "stop_sequence"
                 let markdown = Self.unwrapMarkdown(text)
@@ -516,7 +572,8 @@ struct ClaudeClient {
     """
 
     private static func run(body: [String: Any],
-                            continuation: AsyncThrowingStream<ClaudeStreamEvent, Error>.Continuation) async throws {
+                            continuation: AsyncThrowingStream<ClaudeStreamEvent, Error>.Continuation,
+                            stopDetails: ClaudeStopDetailsSink? = nil) async throws {
         let (apiKey, model) = await MainActor.run {
             (AppSettings.shared.effectiveAPIKey, AppSettings.shared.model)
         }
@@ -551,7 +608,7 @@ struct ClaudeClient {
                 throw ClaudeError(type: "invalid_response", message: "Unexpected response from the Claude API.")
             }
             if http.statusCode == 200 {
-                try await consume(bytes, continuation: continuation)
+                try await consume(bytes, continuation: continuation, stopDetails: stopDetails)
                 return
             }
             let errorBody = await readLimited(bytes, limit: maxErrorBodyBytes)
@@ -566,7 +623,8 @@ struct ClaudeClient {
     }
 
     private static func consume(_ bytes: URLSession.AsyncBytes,
-                                continuation: AsyncThrowingStream<ClaudeStreamEvent, Error>.Continuation) async throws {
+                                continuation: AsyncThrowingStream<ClaudeStreamEvent, Error>.Continuation,
+                                stopDetails: ClaudeStopDetailsSink?) async throws {
         var parser = SSEParser()
         var acc = MessageAccumulator()
 
@@ -618,6 +676,9 @@ struct ClaudeClient {
         }
 
         let content = try ClaudeJSON.data(acc.orderedBlocks)
+        if let sink = stopDetails, let d = acc.stopDetails {
+            sink.set(category: d["category"] as? String, explanation: d["explanation"] as? String)
+        }
         continuation.yield(.done(contentJSON: content, text: acc.text, stopReason: acc.stopReason))
     }
 

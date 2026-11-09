@@ -146,6 +146,12 @@ final class PaperSession: ObservableObject {
 
     var isChatBusy: Bool { chat.streamingText != nil || chat.isThinking }
 
+    /// Reprocess is about to rebuild this paper's text: rebuild the chat engine once it is ready
+    /// again (when no conversation is open), so new questions see the new text.
+    func prepareForReprocess() {
+        engineBuiltBeforeReady = true
+    }
+
     /// The engine snapshots title/authors at init. If the paper was still importing when the
     /// session opened, rebuild it once content is ready (only when nothing is in flight).
     func importStateChanged() {
@@ -236,8 +242,44 @@ final class AppCommands: ObservableObject {
     func launch(context: ModelContext) {
         guard !didLaunch else { return }
         didLaunch = true
+        // Settings ▸ Export all reaches the library through this container (never a default one).
+        NotesFiles.register(context)
+        Importer.shared.onRedirect = { [weak self] from, to, message in
+            self?.redirect(from: from, to: to, message: message)
+        }
         Importer.recoverInterrupted(context: context)
         Importer.shared.resumeReferences(context: context)
+    }
+
+    /// An import turned out to be a paper already in the library (`from` is about to be
+    /// deleted): show `to` instead.
+    func redirect(from: UUID, to: UUID, message: String?) {
+        if session?.paperID == from {
+            session?.close()
+            session = nil
+        }
+        if selectedPaperID == from { selectedPaperID = to }
+        if let message { flash(message) }
+    }
+
+    // MARK: Reprocess
+
+    /// Reruns the import pipeline (identity, text) for a paper, keeping notes, highlights and chats.
+    func reprocess(_ paper: Paper, context: ModelContext) {
+        guard Importer.shared.canReprocess(paper) else { NSSound.beep(); return }
+        if session?.paperID == paper.id { session?.prepareForReprocess() }
+        Importer.shared.reprocess(paper, context: context)
+    }
+
+    /// Paper ▸ Reprocess applies to the open paper.
+    var canReprocessCurrent: Bool {
+        guard let session, !session.paper.isDeleted else { return false }
+        return Importer.shared.canReprocess(session.paper)
+    }
+
+    func reprocessCurrent() {
+        guard let session else { return }
+        reprocess(session.paper, context: session.context)
     }
 
     /// Opens a session for `selectedPaperID`, cancelling the previous paper's chat.
@@ -475,6 +517,10 @@ struct PaperreadsCommands: Commands {
                 .disabled(app.session == nil)
             Button("New Chat") { app.newChat() }
                 .disabled(app.session == nil)
+            Divider()
+            Button("Reprocess") { app.reprocessCurrent() }
+                .disabled(!app.canReprocessCurrent)
+                .help("Import this paper again: re-identify it and rebuild its text. Notes, highlights and chats are kept.")
         }
     }
 }
