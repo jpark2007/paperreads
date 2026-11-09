@@ -143,25 +143,45 @@ enum NotesFiles {
     }
 
     /// Synchronous flush (app termination). Never pulls; never clobbers an external edit.
-    static func flushSync(_ snapshot: Snapshot) {
+    /// `cancelExport` stops a running "Export all" first so the caller (quit) doesn't wait
+    /// behind the whole library.
+    static func flushSync(_ snapshot: Snapshot, cancelExport: Bool = false) {
+        if cancelExport { exportGeneration.bump() }
         let folder = self.folder
         IO.queue.sync { _ = IO.shared.reconcile(snapshot, folder: folder, allowPull: false) }
     }
 
+    /// Bumped to cancel exports started before the bump.
+    private final class Generation: @unchecked Sendable {
+        private let lock = NSLock()
+        private var value = 0
+        var current: Int { lock.lock(); defer { lock.unlock() }; return value }
+        func bump() { lock.lock(); value += 1; lock.unlock() }
+    }
+    private static let exportGeneration = Generation()
+
     /// Writes every snapshot; returns (files written or already current, failure messages).
     static func exportAll(_ snapshots: [Snapshot]) async -> (count: Int, failures: [String]) {
         let folder = self.folder
+        let generation = exportGeneration.current
         return await withCheckedContinuation { cont in
             IO.queue.async {
                 var ok = 0
                 var failures: [String] = []
+                // One directory listing for the whole export; the index is written once at the end.
+                let names = IO.shared.listing(of: folder)
                 for s in snapshots {
+                    if exportGeneration.current != generation {
+                        failures.append("Export cancelled.")
+                        break
+                    }
                     // Export never pulls: an externally edited file is left alone (.deferred).
-                    switch IO.shared.reconcile(s, folder: folder, allowPull: false) {
+                    switch IO.shared.reconcile(s, folder: folder, allowPull: false, names: names, persist: false) {
                     case .failed(let msg): failures.append("\(s.title): \(msg)")
                     default: ok += 1
                     }
                 }
+                IO.shared.persistIndex()
                 cont.resume(returning: (ok, failures))
             }
         }
@@ -240,7 +260,9 @@ enum NotesFiles {
             case "\t": out += "\\t"
             default:
                 if CharacterSet.controlCharacters.contains(scalar) {
-                    out += String(format: "\\u%04X", scalar.value)
+                    out += scalar.value > 0xFFFF
+                        ? String(format: "\\U%08X", scalar.value)
+                        : String(format: "\\u%04X", scalar.value)
                 } else {
                     out.unicodeScalars.append(scalar)
                 }
@@ -305,15 +327,16 @@ enum NotesFiles {
     /// The section ends at the LAST "## Highlights" line (generated text never contains one,
     /// so user notes may safely contain their own "## Highlights" heading above it).
     static func notesSection(of markdown: String) -> String? {
-        guard let (all, notesIdx, stop) = notesBounds(of: markdown) else { return nil }
+        guard let (all, _, notesIdx, stop) = notesBounds(of: markdown) else { return nil }
         var lines = Array(all[(notesIdx + 1)..<stop])
         // Drop the blank line(s) right after the heading that we emit.
         while let first = lines.first, first.trimmingCharacters(in: .whitespaces).isEmpty { lines.removeFirst() }
         return normalizedNotes(lines.joined(separator: "\n"))
     }
 
-    /// Lines of the file plus the "## Notes" heading index and the (exclusive) end of its body.
-    private static func notesBounds(of markdown: String) -> ([String], Int, Int)? {
+    /// Lines of the file, the first line after the front matter, the "## Notes" heading index
+    /// and the (exclusive) end of its body.
+    private static func notesBounds(of markdown: String) -> ([String], Int, Int, Int)? {
         let text = markdown.replacingOccurrences(of: "\r\n", with: "\n")
         let lines = text.components(separatedBy: "\n")
         // Skip YAML front matter.
@@ -323,14 +346,23 @@ enum NotesFiles {
         else { return nil }
         let endIdx = lines.lastIndex(where: { $0.trimmingCharacters(in: .whitespaces) == "## Highlights" })
         let stop = (endIdx.map { $0 > notesIdx ? $0 : lines.count }) ?? lines.count
-        return (lines, notesIdx, stop)
+        return (lines, start, notesIdx, stop)
     }
 
     /// Hash of everything in the file EXCEPT the Notes body (front matter, title, highlights,
     /// trailing text). Lets reconcile tell an edit outside "## Notes" from a Notes edit.
     static func restHash(of markdown: String) -> String? {
-        guard let (lines, notesIdx, stop) = notesBounds(of: markdown) else { return nil }
+        guard let (lines, _, notesIdx, stop) = notesBounds(of: markdown) else { return nil }
         let rest = lines[...notesIdx] + ["\u{0}"] + lines[stop...]
+        return hash(rest.joined(separator: "\n"))
+    }
+
+    /// Like `restHash`, but also ignoring the front matter and the H1: the parts that change
+    /// with the title. Used to compare a stale pre-rename file with what we last wrote.
+    static func bodyHash(of markdown: String) -> String? {
+        guard let (lines, start, notesIdx, stop) = notesBounds(of: markdown) else { return nil }
+        let pre = lines[start..<notesIdx].filter { !$0.hasPrefix("# ") }
+        let rest = pre + ["\u{0}"] + lines[stop...]
         return hash(rest.joined(separator: "\n"))
     }
 
@@ -344,7 +376,7 @@ enum NotesFiles {
         static let queue = DispatchQueue(label: "com.jonahpark.Paperreads.notesfiles", qos: .utility)
         static let shared = IO()
 
-        struct Entry: Codable {
+        struct Entry: Codable, Equatable {
             var folder: String
             var filename: String
             var contentHash: String
@@ -352,9 +384,13 @@ enum NotesFiles {
             var mtime: Date
             /// `restHash(of:)` of what we last wrote (nil in indexes from older builds).
             var restHash: String?
+            /// `bodyHash(of:)` of what we last wrote (nil in indexes from older builds).
+            var bodyHash: String?
         }
 
-        private var index: [String: Entry]?   // paperId → entry; loaded lazily on the queue
+        // "<paperId>|<folder path>" → entry, so returning to a folder keeps its baseline.
+        // (Older indexes are keyed by paperId alone; those entries are still read.)
+        private var index: [String: Entry]?   // loaded lazily on the queue
         private let fm = FileManager.default
         private var indexURL: URL { PaperStore.appSupport.appendingPathComponent("notes-index.json") }
 
@@ -378,6 +414,27 @@ enum NotesFiles {
             if let data = try? enc.encode(idx) { try? data.write(to: indexURL, options: .atomic) }
         }
 
+        /// Writes the in-memory index (after a batch of `persist: false` reconciles).
+        func persistIndex() {
+            if let index { saveIndex(index) }
+        }
+
+        private func key(_ id: UUID, _ folder: URL) -> String { id.uuidString + "|" + folder.path }
+
+        private func entry(in idx: [String: Entry], id: UUID, folder: URL) -> Entry? {
+            if let e = idx[key(id, folder)] { return e }
+            return idx[id.uuidString].flatMap { $0.folder == folder.path ? $0 : nil }
+        }
+
+        private func setEntry(_ e: Entry, in idx: inout [String: Entry], id: UUID, folder: URL) {
+            idx[key(id, folder)] = e
+            if idx[id.uuidString]?.folder == folder.path { idx.removeValue(forKey: id.uuidString) }
+        }
+
+        func listing(of folder: URL) -> [String] {
+            ((try? fm.contentsOfDirectory(atPath: folder.path)) ?? []).filter { !$0.hasPrefix(".") }
+        }
+
         private func mtime(_ url: URL) -> Date? {
             (try? fm.attributesOfItem(atPath: url.path))?[.modificationDate] as? Date
         }
@@ -388,9 +445,11 @@ enum NotesFiles {
         }
 
         /// Locate this paper's existing file in `folder` (index first, then a suffix scan).
-        private func existingFile(for s: Snapshot, entry: Entry?, folder: URL, expected: URL) -> URL? {
+        /// `names`: a pre-taken folder listing (export); candidates are re-checked on disk.
+        private func existingFile(for s: Snapshot, entry: Entry?, folder: URL, expected: URL,
+                                  names: [String]?) -> URL? {
             let suffix = NotesFiles.suffix(for: s.id)
-            let names = (try? fm.contentsOfDirectory(atPath: folder.path)) ?? []
+            let names = names ?? listing(of: folder)
             let candidates = names.filter { $0.hasSuffix(suffix) && !$0.hasPrefix(".") }
                 .map { folder.appendingPathComponent($0) }
                 .filter(exists)
@@ -413,12 +472,18 @@ enum NotesFiles {
 
         func confirmPulled(id: UUID, notes: String, url: URL, folder: URL) {
             var idx = loadIndex()
-            let key = id.uuidString
-            guard var e = idx[key], e.folder == folder.path,
+            guard var e = entry(in: idx, id: id, folder: folder),
                   let data = try? Data(contentsOf: url), let text = String(data: data, encoding: .utf8),
                   let n = NotesFiles.notesSection(of: text),
                   n == NotesFiles.normalizedNotes(notes) else { return }
             e.notesHash = NotesFiles.hash(n)
+            if url.lastPathComponent != e.filename, exists(folder.appendingPathComponent(e.filename)) {
+                // Pulled from a stale duplicate (e.g. an editor re-saved the pre-rename path):
+                // keep the baseline of the file we own; only the Notes text is now adopted.
+                setEntry(e, in: &idx, id: id, folder: folder)
+                saveIndex(idx)
+                return
+            }
             e.filename = url.lastPathComponent
             e.mtime = mtime(url) ?? e.mtime
             // Only take the whole file as baseline if nothing outside Notes changed too;
@@ -426,11 +491,13 @@ enum NotesFiles {
             if let r = e.restHash, NotesFiles.restHash(of: text) == r {
                 e.contentHash = NotesFiles.hash(text)
             }
-            idx[key] = e
+            setEntry(e, in: &idx, id: id, folder: folder)
             saveIndex(idx)
         }
 
-        func reconcile(_ s: Snapshot, folder: URL, allowPull: Bool) -> Outcome {
+        /// `persist: false` updates the index in memory only (call `persistIndex()` afterwards).
+        func reconcile(_ s: Snapshot, folder: URL, allowPull: Bool,
+                       names: [String]? = nil, persist: Bool = true) -> Outcome {
             do {
                 try fm.createDirectory(at: folder, withIntermediateDirectories: true)
             } catch {
@@ -438,20 +505,20 @@ enum NotesFiles {
             }
 
             var idx = loadIndex()
-            let key = s.id.uuidString
             // Entries recorded for a different folder don't describe files in this one.
-            let entry = idx[key].flatMap { $0.folder == folder.path ? $0 : nil }
+            let entry = self.entry(in: idx, id: s.id, folder: folder)
             let expected = folder.appendingPathComponent(NotesFiles.fileName(for: s))
             let content = NotesFiles.render(s)
             let contentHash = NotesFiles.hash(content)
             let contentRestHash = NotesFiles.restHash(of: content)
+            let contentBodyHash = NotesFiles.bodyHash(of: content)
             let currentNotes = NotesFiles.normalizedNotes(s.notes)
             let currentNotesHash = NotesFiles.hash(currentNotes)
 
             var target = expected
             var backupURL: URL?
 
-            if let existing = existingFile(for: s, entry: entry, folder: folder, expected: expected) {
+            if let existing = existingFile(for: s, entry: entry, folder: folder, expected: expected, names: names) {
                 let diskData: Data
                 do {
                     diskData = try Data(contentsOf: existing)
@@ -479,7 +546,11 @@ enum NotesFiles {
                             externalNotes = NotesFiles.notesSection(of: diskText)
                             if let n = externalNotes {
                                 if NotesFiles.hash(n) != e.notesHash { externallyChanged = true }
-                                if let r = e.restHash {
+                                if existing.lastPathComponent != e.filename, let b = e.bodyHash {
+                                    // A stale pre-rename duplicate: its front matter and H1
+                                    // still carry the old title, which is not an edit.
+                                    outsideEdit = NotesFiles.bodyHash(of: diskText) != b
+                                } else if let r = e.restHash {
                                     outsideEdit = NotesFiles.restHash(of: diskText) != r
                                 } else {
                                     // Older index: no record of the rest; a change that isn't
@@ -491,10 +562,15 @@ enum NotesFiles {
                             }
                         }
                     } else if let n = NotesFiles.notesSection(of: diskText) {
-                        // No record of writing this file (index lost / folder switched).
+                        // No record of writing this file (index lost / folder switched): anything
+                        // outside Notes that differs from what we'd write would be regenerated,
+                        // so treat it as an outside edit and keep a copy first.
                         if n != currentNotes {
                             externalNotes = n
                             externallyChanged = true
+                        }
+                        if diskHash != contentHash {
+                            outsideEdit = NotesFiles.restHash(of: diskText) != contentRestHash
                         }
                     } else if diskHash != contentHash {
                         unparseableEdit = true
@@ -539,6 +615,26 @@ enum NotesFiles {
                 // Rename on title change (the only operation that removes a path we own).
                 if existing.lastPathComponent != expected.lastPathComponent {
                     if exists(expected) {
+                        // Several files carry this id and the newest one isn't the expected
+                        // name: the expected file is about to be overwritten without having
+                        // been checked above, so preserve it unless it's what we wrote.
+                        let expData: Data
+                        do {
+                            expData = try Data(contentsOf: expected)
+                        } catch {
+                            return .failed("Couldn't read \(expected.lastPathComponent) (\(error.localizedDescription))")
+                        }
+                        let expHash = String(data: expData, encoding: .utf8).map(NotesFiles.hash)
+                        let ours = expHash != nil && (expHash == contentHash || expHash == entry?.contentHash)
+                        if !ours {
+                            let backup = conflictURL(for: expected)
+                            do {
+                                try fm.copyItem(at: expected, to: backup)
+                                if backupURL == nil { backupURL = backup }
+                            } catch {
+                                return .failed("Couldn't preserve the externally edited file (\(error.localizedDescription))")
+                            }
+                        }
                         target = expected   // leave the old one alone rather than overwrite
                     } else {
                         do {
@@ -552,11 +648,17 @@ enum NotesFiles {
                 // Content unchanged: just make sure the index is current.
                 if backupURL == nil, target.path == existing.path || !exists(existing),
                    let diskHash, diskHash == contentHash {
-                    let m = mtime(target) ?? Date()
-                    idx[key] = Entry(folder: folder.path, filename: target.lastPathComponent,
-                                     contentHash: contentHash, notesHash: currentNotesHash, mtime: m,
-                                     restHash: contentRestHash)
-                    saveIndex(idx)
+                    let old = self.entry(in: idx, id: s.id, folder: folder)
+                    var m = mtime(target) ?? Date()
+                    if let old, abs(old.mtime.timeIntervalSince(m)) < 1 { m = old.mtime }   // JSON second precision
+                    let e = Entry(folder: folder.path, filename: target.lastPathComponent,
+                                  contentHash: contentHash, notesHash: currentNotesHash, mtime: m,
+                                  restHash: contentRestHash, bodyHash: contentBodyHash)
+                    // Only touch the index when the entry actually changed.
+                    if old != e || idx[key(s.id, folder)] == nil {
+                        setEntry(e, in: &idx, id: s.id, folder: folder)
+                        store(idx, persist: persist)
+                    }
                     return .synced(target)
                 }
             }
@@ -566,12 +668,18 @@ enum NotesFiles {
             } catch {
                 return .failed("Couldn't write \(target.lastPathComponent) (\(error.localizedDescription))")
             }
-            idx[key] = Entry(folder: folder.path, filename: target.lastPathComponent,
-                             contentHash: contentHash, notesHash: currentNotesHash,
-                             mtime: mtime(target) ?? Date(), restHash: contentRestHash)
-            saveIndex(idx)
+            setEntry(Entry(folder: folder.path, filename: target.lastPathComponent,
+                           contentHash: contentHash, notesHash: currentNotesHash,
+                           mtime: mtime(target) ?? Date(), restHash: contentRestHash,
+                           bodyHash: contentBodyHash),
+                     in: &idx, id: s.id, folder: folder)
+            store(idx, persist: persist)
             if let backupURL { return .conflict(url: target, backup: backupURL) }
             return .synced(target)
+        }
+
+        private func store(_ idx: [String: Entry], persist: Bool) {
+            if persist { saveIndex(idx) } else { index = idx }
         }
 
         private func conflictURL(for url: URL) -> URL {

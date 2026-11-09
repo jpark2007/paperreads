@@ -274,6 +274,18 @@
     scrollRaf = 0;
     updateProgress();
     if (hold || !blocks.length) return;
+    // A layout shift above the anchor that landed in this frame (a KaTeX batch from an earlier
+    // rAF callback, a late image) would otherwise be measured as the new baseline and never
+    // corrected while the user scrolls. Scrolling never changes document coordinates, so any
+    // change of the anchor's document top is a layout shift: compensate it before re-measuring.
+    const a = lastKnown;
+    if (a && a.el && a.el.isConnected) {
+      const r = a.el.getBoundingClientRect();
+      if (Math.abs(r.height - a.height) <= 1) {
+        const delta = r.top + global.scrollY - a.docTop;
+        if (Math.abs(delta) >= 1) global.scrollBy(0, delta);
+      }
+    }
     lastKnown = measureAnchor();
     schedulePost();
   }

@@ -62,7 +62,7 @@ struct NotesPanel: View {
         // ⌘Q inside the debounce window: flush synchronously before the process exits.
         .onReceive(NotificationCenter.default.publisher(for: NSApplication.willTerminateNotification)) { _ in
             saveNow()
-            flushFileSync()
+            flushFileSync(terminating: true)
         }
         .onReceive(NotificationCenter.default.publisher(for: NotesFiles.folderDidChange)) { _ in
             fileURL = nil
@@ -103,12 +103,12 @@ struct NotesPanel: View {
         }
     }
 
-    private func flushFileSync(onlyIfPending: Bool = false) {
+    private func flushFileSync(onlyIfPending: Bool = false, terminating: Bool = false) {
         if onlyIfPending, fileTask == nil { return }
         fileTask?.cancel()
         fileTask = nil
         guard isPaperAlive else { return }
-        NotesFiles.flushSync(fileSnapshot)
+        NotesFiles.flushSync(fileSnapshot, cancelExport: terminating)
     }
 
     private func apply(_ outcome: NotesFiles.Outcome, requestedNotes: String) {

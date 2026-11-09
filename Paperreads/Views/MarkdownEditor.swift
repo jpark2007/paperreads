@@ -301,8 +301,10 @@ enum MarkdownStyler {
     static func style(_ storage: NSTextStorage, range: NSRange) {
         let ns = storage.string as NSString
         guard ns.length > 0 else { return }
-        let clamped = NSRange(location: min(range.location, ns.length),
-                              length: min(range.length, ns.length - min(range.location, ns.length)))
+        let loc = min(range.location, ns.length)
+        // One extra character so the paragraph that starts right after the edit is restyled too:
+        // splitting a heading/bold line with Return must restyle the second half as well.
+        let clamped = NSRange(location: loc, length: min(range.length + 1, ns.length - loc))
         let paraRange = ns.paragraphRange(for: clamped)
         ns.enumerateSubstrings(in: paraRange, options: [.byParagraphs, .substringNotRequired]) { _, lineRange, enclosing, _ in
             styleParagraph(storage, ns: ns, line: lineRange, enclosing: enclosing)
