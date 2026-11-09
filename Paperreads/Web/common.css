@@ -1,0 +1,244 @@
+/* Paperreads — shared tokens and prose typography (module A). Editorial Minimal, light. */
+
+:root {
+  --bg: #f2efe6;
+  --ink: #211d17;
+  --muted: #565145;
+  --faint: #7d7669;
+  --hairline: rgba(33, 29, 23, 0.12);
+  --accent: #d97757;
+  --accent-text: #b04f2f;
+  --highlight: rgba(217, 119, 87, 0.22);
+  --danger: #c4472f;
+  --selection: rgba(86, 81, 69, 0.18);
+
+  --serif: ui-serif, "New York", "Iowan Old Style", "Charter", Georgia, serif;
+  --rounded: ui-rounded, -apple-system, "SF Pro Rounded", "SF Pro Text", system-ui, sans-serif;
+  --mono: ui-monospace, "SF Mono", Menlo, Monaco, monospace;
+
+  --s1: 8px;
+  --s2: 16px;
+  --s3: 24px;
+  --s4: 32px;
+  --s6: 48px;
+
+  color-scheme: light;
+}
+
+*, *::before, *::after { box-sizing: border-box; }
+
+html {
+  background: var(--bg);
+  -webkit-text-size-adjust: 100%;
+}
+
+body {
+  margin: 0;
+  background: var(--bg);
+  color: var(--ink);
+  font-family: var(--serif);
+  -webkit-font-smoothing: antialiased;
+  text-rendering: optimizeLegibility;
+  font-kerning: normal;
+  font-variant-ligatures: common-ligatures;
+  font-feature-settings: "kern", "liga", "onum";
+}
+
+::selection { background: var(--selection); }
+
+:focus { outline: none; }
+:focus-visible {
+  outline: 1.5px solid var(--accent);
+  outline-offset: 2px;
+  border-radius: 4px;
+}
+
+.caps {
+  font-family: var(--rounded);
+  font-size: 11px;
+  font-weight: 700;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  color: var(--muted);
+}
+
+/* ---------------------------------------------------------------- prose */
+
+.prose { color: var(--ink); hyphens: auto; -webkit-hyphens: auto; overflow-wrap: break-word; }
+
+.prose p { margin: 0 0 1em; }
+.prose p:last-child { margin-bottom: 0; }
+
+.prose h1, .prose h2, .prose h3, .prose h4 {
+  font-family: var(--serif);
+  font-weight: 600;
+  color: var(--ink);
+  line-height: 1.25;
+  hyphens: manual;
+  -webkit-hyphens: manual;
+  text-wrap: balance;
+}
+.prose h1 { font-size: 1.6em; margin: 1.6em 0 0.6em; }
+.prose h2 { font-size: 1.36em; margin: 2.4em 0 0.7em; letter-spacing: -0.005em; }
+.prose h3 { font-size: 1.14em; margin: 1.9em 0 0.55em; }
+.prose h4 { font-size: 1em; margin: 1.6em 0 0.4em; font-style: italic; font-weight: 600; }
+.prose > :first-child { margin-top: 0; }
+
+.prose .tag { color: var(--faint); font-weight: inherit; }
+.prose h2 .tag, .prose h3 .tag, .prose h4 .tag { margin-right: 0.45em; font-variant-numeric: lining-nums tabular-nums; }
+
+.prose a { color: var(--accent-text); text-decoration: none; }
+.prose a[href]:hover { text-decoration: underline; text-decoration-thickness: 1px; text-underline-offset: 3px; }
+.prose a.xref { cursor: pointer; }
+.prose a.xref:hover { text-decoration: underline; text-decoration-thickness: 1px; text-underline-offset: 3px; }
+.prose cite { font-style: normal; }
+
+.prose em, .prose i { font-style: italic; }
+.prose strong, .prose b { font-weight: 600; }
+.prose sub, .prose sup { font-size: 0.72em; line-height: 0; }
+.prose .sc { font-variant: small-caps; letter-spacing: 0.02em; }
+.prose sup.fnref { color: var(--accent-text); font-family: var(--rounded); font-weight: 600; padding-left: 1px; }
+
+.prose ul, .prose ol { margin: 0 0 1em; padding-left: 1.4em; }
+.prose li { margin: 0.3em 0; }
+.prose li > p { margin: 0 0 0.45em; }
+.prose li::marker { color: var(--faint); }
+.prose ul.tagged, .prose ol.tagged { list-style: none; padding-left: 1.9em; }
+.prose ul.tagged > li > .tag:first-child,
+.prose ol.tagged > li > .tag:first-child {
+  float: left;
+  margin-left: -1.9em;
+  width: 1.6em;
+  text-align: right;
+  color: var(--faint);
+}
+
+.prose blockquote {
+  margin: 1.2em 0;
+  padding: 0 0 0 1.1em;
+  border-left: 1.5px solid var(--hairline);
+  color: var(--muted);
+}
+
+.prose code {
+  font-family: var(--mono);
+  font-size: 0.84em;
+  color: var(--ink);
+  background: rgba(33, 29, 23, 0.05);
+  border-radius: 4px;
+  padding: 0.08em 0.3em;
+  hyphens: none;
+  -webkit-hyphens: none;
+}
+.prose pre {
+  font-family: var(--mono);
+  font-size: 0.8em;
+  line-height: 1.55;
+  margin: 1.2em 0;
+  padding: 0.2em 0 0.2em 1.1em;
+  border-left: 1.5px solid var(--hairline);
+  overflow-x: auto;
+  white-space: pre;
+}
+.prose pre code { background: none; padding: 0; font-size: 1em; }
+
+/* figures */
+.prose figure { margin: 2em 0; }
+.prose figure figure { margin: 0.6em 0; }
+.prose img { max-width: 100%; height: auto; display: inline-block; vertical-align: middle; }
+.prose figure img { display: block; margin: 0 auto; mix-blend-mode: multiply; }
+.prose figcaption {
+  font-size: 0.84em;
+  line-height: 1.5;
+  color: var(--muted);
+  margin-top: 0.85em;
+}
+.prose figcaption .tag { color: var(--ink); font-weight: 600; }
+.prose .flexfig { display: flex; flex-wrap: wrap; gap: var(--s2); justify-content: center; align-items: flex-end; }
+.prose .flexfig > .panel, .prose .flexfig > figure { flex: 1 1 200px; margin: 0; }
+
+/* tables */
+.prose table {
+  border-collapse: collapse;
+  margin: 0 auto;
+  font-size: 0.84em;
+  line-height: 1.4;
+  font-variant-numeric: lining-nums tabular-nums;
+}
+.prose td, .prose th {
+  padding: 0.35em 0.7em;
+  vertical-align: top;
+  text-align: left;
+}
+.prose th { font-weight: 600; }
+.prose thead tr:last-child > * { border-bottom: 1px solid var(--hairline); }
+.prose table.tabular:not(:has(.rt, .rb)) tbody tr + tr > * { border-top: 1px solid var(--hairline); }
+.prose .rt { border-top: 1px solid rgba(33, 29, 23, 0.45); }
+.prose .rb { border-bottom: 1px solid rgba(33, 29, 23, 0.45); }
+.prose td.c, .prose th.c { text-align: center; }
+.prose td.r, .prose th.r { text-align: right; }
+.prose td.l, .prose th.l { text-align: left; }
+.prose .tscroll { overflow-x: auto; margin: 1.4em 0; -webkit-overflow-scrolling: touch; }
+.prose .tscroll > table { margin: 0 auto; }
+
+/* math */
+.prose span.m { font-size: 1.02em; }
+.prose span.m .katex { font-size: 1.08em; text-rendering: auto; }
+.prose span.m[data-d="1"] { display: block; margin: 0.9em 0; overflow-x: auto; overflow-y: hidden; }
+.prose span.m[data-d="1"] .katex-display { margin: 0; }
+.prose .eq {
+  position: relative;
+  margin: 1.3em 0;
+  padding: 0 3.6em;
+  text-align: center;
+}
+.prose .eq > span.m,
+.prose .eq > mark > span.m { display: block; margin: 0; overflow-x: auto; overflow-y: hidden; padding: 0.15em 0; }
+.prose .eq .eqn {
+  position: absolute;
+  right: 0;
+  top: 50%;
+  transform: translateY(-50%);
+  color: var(--faint);
+  font-variant-numeric: lining-nums tabular-nums;
+  font-size: 0.92em;
+}
+code.tex-fallback {
+  font-family: var(--mono);
+  font-size: 0.8em;
+  color: var(--muted);
+  background: rgba(33, 29, 23, 0.05);
+  border-radius: 4px;
+  padding: 0.05em 0.3em;
+  white-space: pre-wrap;
+  word-break: break-word;
+}
+.prose span.m[data-d="1"] code.tex-fallback { display: inline-block; text-align: left; }
+
+/* LaTeXML structures */
+.prose .theorem, .prose .proof { margin: 1.4em 0; }
+.prose .theorem p { font-style: italic; }
+.prose .theorem p.runin { font-style: normal; }
+.prose p.runin { margin-bottom: 0.35em; }
+.prose .proof p.runin strong { font-weight: 400; font-style: italic; }
+.prose p.note {
+  font-size: 0.8em;
+  line-height: 1.5;
+  color: var(--muted);
+  margin: -0.4em 0 1.2em;
+  padding-left: 1.1em;
+  border-left: 1px solid var(--hairline);
+}
+.prose p.note > sup:first-child { color: var(--accent-text); font-family: var(--rounded); font-weight: 600; }
+.prose .listing, .prose .algo {
+  font-size: 0.86em;
+  line-height: 1.5;
+  margin: 1.4em 0;
+  padding-left: 1.1em;
+  border-left: 1.5px solid var(--hairline);
+}
+.prose .line { display: block; white-space: pre-wrap; }
+.prose ul.biblist { list-style: none; padding-left: 0; font-size: 0.86em; line-height: 1.5; }
+.prose ul.biblist > li.bibitem { margin: 0 0 0.75em; padding-left: 2.6em; text-indent: -2.6em; }
+.prose ul.biblist > li.bibitem .tag { color: var(--faint); display: inline-block; min-width: 2.6em; text-indent: 0; }
+.prose .ack { color: var(--muted); }

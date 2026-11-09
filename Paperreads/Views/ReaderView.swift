@@ -1,0 +1,334 @@
+import SwiftUI
+import AppKit
+import SwiftData
+
+/// Center column: header (title, meta, status, Text|PDF) over the clean text or the PDF.
+struct ReaderView: View {
+    @ObservedObject var session: PaperSession
+    @EnvironmentObject private var app: AppCommands
+
+    private var paper: Paper { session.paper }
+
+    var body: some View {
+        VStack(spacing: 0) {
+            ReaderHeader(paper: paper)
+            Hairline()
+            ZStack {
+                textLayer
+                    .opacity(app.readerMode == .text ? 1 : 0)
+                    .allowsHitTesting(app.readerMode == .text)
+                if app.readerMode == .pdf {
+                    pdfLayer
+                }
+            }
+            .frame(maxWidth: .infinity, maxHeight: .infinity)
+        }
+        .background(Theme.bg)
+    }
+
+    // MARK: Text
+
+    @ViewBuilder
+    private var textLayer: some View {
+        switch paper.importState {
+        case .queued, .fetching, .converting, .indexing:
+            ImportProgressView(paper: paper)
+        case .failed:
+            ImportFailedView(paper: paper)
+        case .ready:
+            if paper.contentKind == .none {
+                ReaderMessage(
+                    label: "No clean text",
+                    message: "This paper has no text view yet.",
+                    actionTitle: paper.hasPDF ? "View PDF" : nil,
+                    action: { app.readerMode = .pdf }
+                )
+            } else if let page = WebBridge.pageURL("reader") {
+                ReaderTextContent(paper: paper, session: session, page: page)
+            } else {
+                ReaderMessage(label: "Reader unavailable",
+                              message: "The reader page is missing from this build.",
+                              isError: true)
+            }
+        }
+    }
+
+    // MARK: PDF
+
+    @ViewBuilder
+    private var pdfLayer: some View {
+        if paper.hasPDF {
+            PDFKitView(url: PaperStore.pdfURL(paper.id))
+                .background(Theme.bg)
+        } else {
+            ReaderMessage(
+                label: "No PDF",
+                message: "No original PDF was saved for this paper.",
+                actionTitle: "Show clean text",
+                action: { app.readerMode = .text }
+            )
+            .background(Theme.bg)
+        }
+    }
+}
+
+/// Hosts the WebReader with this paper's live highlight list.
+private struct ReaderTextContent: View {
+    let paper: Paper
+    @ObservedObject var session: PaperSession
+    let page: URL
+    @EnvironmentObject private var app: AppCommands
+    @Query private var highlights: [Highlight]
+
+    init(paper: Paper, session: PaperSession, page: URL) {
+        self.paper = paper
+        self.session = session
+        self.page = page
+        let pid = paper.id
+        _highlights = Query(filter: #Predicate<Highlight> { $0.paperId == pid },
+                            sort: [SortDescriptor(\Highlight.createdAt)])
+    }
+
+    var body: some View {
+        WebReader(
+            page: page,
+            paperID: paper.id,
+            contentToken: "\(paper.contentKindRaw)|\(paper.importStateRaw)",
+            highlights: highlights.filter { $0.paperId == paper.id }.map(ReaderHighlightPayload.init),
+            bridge: session.reader,
+            onSelection: { action, selection in app.handleReaderSelection(action, selection) },
+            onHighlightClicked: { app.highlightClicked($0) }
+        )
+    }
+}
+
+// MARK: - Header
+
+private struct ReaderHeader: View {
+    let paper: Paper
+    @EnvironmentObject private var app: AppCommands
+    @State private var showAbstract = false
+
+    private var meta: String {
+        var parts: [String] = []
+        if !paper.authors.isEmpty {
+            parts.append(paper.authors.count > 6
+                         ? paper.authors.prefix(6).joined(separator: ", ") + " et al."
+                         : paper.authors.joined(separator: ", "))
+        }
+        if let y = paper.year { parts.append(String(y)) }
+        if let a = paper.arxivId, !a.isEmpty { parts.append("arXiv \(a)") }
+        else if let d = paper.doi, !d.isEmpty { parts.append(d) }
+        return parts.joined(separator: " · ")
+    }
+
+    private var abstract: String {
+        paper.abstractText.trimmingCharacters(in: .whitespacesAndNewlines)
+    }
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: Theme.Space.m) {
+            Text(paper.title.isEmpty ? "Untitled paper" : paper.title)
+                .font(.serif(28, weight: .semibold))
+                .foregroundStyle(Theme.ink)
+                .lineSpacing(2)
+                .lineLimit(3)
+                .textSelection(.enabled)
+                .fixedSize(horizontal: false, vertical: true)
+
+            if !meta.isEmpty {
+                Text(meta)
+                    .font(.rounded(13))
+                    .foregroundStyle(Theme.muted)
+                    .lineLimit(2)
+                    .textSelection(.enabled)
+            }
+
+            HStack(alignment: .center, spacing: Theme.Space.m) {
+                StatusPicker(paper: paper)
+                TextSegmented(options: [(ReaderMode.text, "Text"), (ReaderMode.pdf, "PDF")],
+                              selection: $app.readerMode)
+                    .help("Clean text or original PDF (⇧⌘P)")
+                if !abstract.isEmpty {
+                    Button(showAbstract ? "Hide abstract" : "Abstract") {
+                        withAnimation(.easeInOut(duration: 0.18)) { showAbstract.toggle() }
+                    }
+                    .buttonStyle(.text)
+                }
+                Spacer(minLength: 0)
+                if let source = sourceURL {
+                    Button("Source") { WebBridge.openExternally(source) }
+                        .buttonStyle(.text)
+                        .help(source.absoluteString)
+                }
+                Button(app.sidePanelVisible ? "Hide panel" : "Ask · Notes") { app.toggleSidePanel() }
+                    .buttonStyle(.text)
+                    .help("Toggle the side panel (⌘J)")
+            }
+            .padding(.top, Theme.Space.xxs)
+
+            if showAbstract && !abstract.isEmpty {
+                ScrollView {
+                    Text(abstract)
+                        .font(.serif(15))
+                        .foregroundStyle(Theme.muted)
+                        .lineSpacing(5)
+                        .textSelection(.enabled)
+                        .frame(maxWidth: 720, alignment: .leading)
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                }
+                .scrollContentBackground(.hidden)
+                .frame(maxHeight: 200)
+                .transition(.opacity)
+            }
+        }
+        .padding(.horizontal, Theme.Space.xxl)
+        .padding(.top, Theme.Space.l)
+        .padding(.bottom, Theme.Space.l)
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .onChange(of: paper.id) { showAbstract = false }
+    }
+
+    private var sourceURL: URL? {
+        if let s = paper.sourceURL, let u = URL(string: s), u.scheme?.lowercased() == "https" { return u }
+        if let a = paper.arxivId, !a.isEmpty,
+           let enc = a.addingPercentEncoding(withAllowedCharacters: .urlPathAllowed) {
+            return URL(string: "https://arxiv.org/abs/\(enc)")
+        }
+        return nil
+    }
+}
+
+/// Outlined pill showing the reading status; opens a small text-only list.
+struct StatusPicker: View {
+    let paper: Paper
+    @Environment(\.modelContext) private var context
+    @State private var open = false
+
+    var body: some View {
+        Button {
+            open.toggle()
+        } label: {
+            Text(paper.status.label)
+        }
+        .buttonStyle(.pill)
+        .help("Reading status")
+        .popover(isPresented: $open, arrowEdge: .bottom) {
+            VStack(alignment: .leading, spacing: 0) {
+                ForEach(ReadingStatus.allCases, id: \.self) { status in
+                    Button {
+                        paper.status = status
+                        try? context.save()
+                        open = false
+                    } label: {
+                        HStack {
+                            Text(status.label)
+                                .font(.rounded(14, weight: paper.status == status ? .semibold : .regular))
+                                .foregroundStyle(paper.status == status ? Theme.ink : Theme.muted)
+                            Spacer(minLength: Theme.Space.l)
+                        }
+                        .padding(.horizontal, Theme.Space.m)
+                        .frame(height: 32)
+                        .contentShape(Rectangle())
+                    }
+                    .buttonStyle(.plain)
+                }
+            }
+            .padding(.vertical, Theme.Space.xs)
+            .frame(minWidth: 150)
+            .background(Theme.bg)
+        }
+    }
+}
+
+// MARK: - States
+
+private struct ImportProgressView: View {
+    let paper: Paper
+
+    private var headline: String {
+        switch paper.importState {
+        case .queued: "Waiting to import"
+        case .fetching: "Fetching"
+        case .converting: "Converting the PDF to text"
+        case .indexing: "Indexing"
+        default: "Importing"
+        }
+    }
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: Theme.Space.s) {
+            HStack(spacing: Theme.Space.s) {
+                ProgressView()
+                    .controlSize(.small)
+                    .tint(Theme.accent)
+                Text(headline).capsLabel(Theme.accentText)
+            }
+            Text(paper.importStatusDetail?.isEmpty == false ? paper.importStatusDetail! : "Working…")
+                .font(.serif(19))
+                .foregroundStyle(Theme.ink)
+                .fixedSize(horizontal: false, vertical: true)
+            Text("You can keep reading other papers — this one opens as soon as it's ready.")
+                .font(.rounded(13))
+                .foregroundStyle(Theme.faint)
+        }
+        .frame(maxWidth: 520, alignment: .leading)
+        .padding(Theme.Space.xxl)
+        .frame(maxWidth: .infinity, maxHeight: .infinity)
+    }
+}
+
+private struct ImportFailedView: View {
+    let paper: Paper
+    @EnvironmentObject private var app: AppCommands
+    @Environment(\.modelContext) private var context
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: Theme.Space.m) {
+            Text("Import failed").capsLabel(Theme.danger)
+            Text(paper.importStatusDetail?.isEmpty == false ? paper.importStatusDetail! : "Something went wrong while importing this paper.")
+                .font(.serif(19))
+                .foregroundStyle(Theme.ink)
+                .textSelection(.enabled)
+                .fixedSize(horizontal: false, vertical: true)
+            HStack(spacing: Theme.Space.m) {
+                Button("Retry") { Importer.shared.retry(paper, context: context) }
+                    .buttonStyle(.pill)
+                if paper.hasPDF {
+                    Button("View PDF") { app.readerMode = .pdf }
+                        .buttonStyle(.text)
+                }
+            }
+            .padding(.top, Theme.Space.xs)
+        }
+        .frame(maxWidth: 520, alignment: .leading)
+        .padding(Theme.Space.xxl)
+        .frame(maxWidth: .infinity, maxHeight: .infinity)
+    }
+}
+
+private struct ReaderMessage: View {
+    let label: String
+    let message: String
+    var isError = false
+    var actionTitle: String? = nil
+    var action: () -> Void = {}
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: Theme.Space.m) {
+            Text(label).capsLabel(isError ? Theme.danger : Theme.muted)
+            Text(message)
+                .font(.serif(19))
+                .foregroundStyle(Theme.ink)
+                .fixedSize(horizontal: false, vertical: true)
+            if let actionTitle {
+                Button(actionTitle, action: action)
+                    .buttonStyle(.pill)
+                    .padding(.top, Theme.Space.xs)
+            }
+        }
+        .frame(maxWidth: 520, alignment: .leading)
+        .padding(Theme.Space.xxl)
+        .frame(maxWidth: .infinity, maxHeight: .infinity)
+    }
+}

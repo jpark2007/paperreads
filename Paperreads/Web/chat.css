@@ -1,0 +1,115 @@
+/* Paperreads — chat transcript (module A). Narrow side panel (~380pt). */
+
+body {
+  font-size: 16px;
+  line-height: 1.58;
+}
+
+#transcript {
+  padding: var(--s3) var(--s3) var(--s4);
+  min-height: 100vh;
+}
+
+.empty {
+  font-family: var(--serif);
+  font-size: 17px;
+  line-height: 1.5;
+  color: var(--faint);
+  margin: 28vh 0 0;
+  text-align: center;
+  text-wrap: balance;
+}
+.empty em { font-style: italic; color: var(--faint); }
+.empty[hidden] { display: none; }
+
+.turn { padding: var(--s3) 0; }
+.turn + .turn, #messages:not(:empty) + #stream { border-top: 1px solid var(--hairline); }
+#messages > .turn:first-child { padding-top: 0; }
+#messages:empty + #stream { padding-top: 0; }
+
+/* user: right-aligned muted serif, no bubble */
+.turn.user {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-end;
+}
+.turn.user .body {
+  width: fit-content;
+  max-width: 88%;
+  color: var(--muted);
+  font-size: 15.5px;
+  line-height: 1.55;
+}
+.turn.user .body blockquote { color: var(--muted); }
+.turn .label { margin-bottom: 6px; }
+
+/* assistant: full width ink */
+.turn.assistant .body { color: var(--ink); }
+
+.body.prose { font-size: inherit; }
+.prose h1 { font-size: 1.24em; margin: 1.3em 0 0.5em; }
+.prose h2 { font-size: 1.14em; margin: 1.3em 0 0.45em; }
+.prose h3 { font-size: 1.04em; margin: 1.1em 0 0.4em; }
+.prose h4 { font-size: 1em; margin: 1em 0 0.35em; }
+.prose ul, .prose ol { padding-left: 1.25em; }
+.prose blockquote { margin: 0.8em 0; padding-left: 0.9em; }
+.prose pre { font-size: 0.82em; }
+.prose table { font-size: 0.86em; margin: 0; }
+.prose .tscroll { margin: 0.9em 0; }
+.prose span.m[data-d="1"] { margin: 0.7em 0; }
+
+/* citation chips */
+a.cite {
+  display: inline-block;
+  font-family: var(--rounded);
+  font-size: 0.72em;
+  font-weight: 600;
+  line-height: 1.5;
+  color: var(--accent-text);
+  border: 1px solid rgba(176, 79, 47, 0.38);
+  border-radius: 9px;
+  padding: 0 0.5em;
+  margin: 0 0.1em;
+  vertical-align: 0.12em;
+  text-decoration: none;
+  cursor: pointer;
+  white-space: nowrap;
+  font-variant-numeric: lining-nums tabular-nums;
+}
+a.cite:hover { border-color: var(--accent); text-decoration: none; }
+a.cite:focus-visible { outline: 1.5px solid var(--accent); outline-offset: 1px; }
+
+/* live state */
+.thinking {
+  font-family: var(--rounded);
+  font-size: 13px;
+  font-weight: 600;
+  color: var(--faint);
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+.thinking[hidden] { display: none; }
+.thinking .dot {
+  width: 7px;
+  height: 7px;
+  border-radius: 50%;
+  background: var(--accent);
+  animation: pulse 1.2s ease-in-out infinite;
+}
+@keyframes pulse {
+  0%, 100% { opacity: 0.35; transform: scale(0.85); }
+  50% { opacity: 1; transform: scale(1); }
+}
+#stream.streaming .body > :last-child::after {
+  content: "";
+  display: inline-block;
+  width: 6px;
+  height: 6px;
+  margin-left: 5px;
+  border-radius: 50%;
+  background: var(--accent);
+  vertical-align: 0.15em;
+  animation: pulse 1.2s ease-in-out infinite;
+}
+#stream[hidden] { display: none; }

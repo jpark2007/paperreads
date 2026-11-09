@@ -1,0 +1,27 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta http-equiv="Content-Security-Policy" content="default-src 'none'; script-src 'self'; style-src 'self' 'unsafe-inline'; font-src 'self'; img-src 'self' data:;">
+  <meta name="referrer" content="no-referrer">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Paperreads Chat</title>
+  <link rel="stylesheet" href="vendor/katex/katex.min.css">
+  <link rel="stylesheet" href="common.css">
+  <link rel="stylesheet" href="chat.css">
+</head>
+<body>
+  <main id="transcript" aria-live="polite">
+    <p id="empty" class="empty">Ask anything about this paper.</p>
+    <div id="messages"></div>
+    <section id="stream" class="turn assistant" hidden>
+      <div id="thinking" class="thinking" hidden><span class="dot" aria-hidden="true"></span>Thinking…</div>
+      <div id="stream-body" class="prose body"></div>
+    </section>
+  </main>
+  <script src="vendor/katex/katex.min.js"></script>
+  <script src="vendor/marked.min.js"></script>
+  <script src="common.js"></script>
+  <script src="chat.js"></script>
+</body>
+</html>

@@ -1,0 +1,24 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta http-equiv="Content-Security-Policy" content="default-src 'none'; script-src 'self'; style-src 'self' 'unsafe-inline'; font-src 'self'; img-src 'self' https: data:;">
+  <meta name="referrer" content="no-referrer">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Paperreads Reader</title>
+  <link rel="stylesheet" href="vendor/katex/katex.min.css">
+  <link rel="stylesheet" href="common.css">
+  <link rel="stylesheet" href="reader.css">
+</head>
+<body>
+  <main id="column">
+    <article id="paper" class="prose" lang="en"></article>
+  </main>
+  <div id="toolbar" data-pr-ui role="toolbar" aria-label="Selection" hidden>
+    <button type="button" data-action="highlight">Highlight</button><span class="sep" aria-hidden="true">·</span><button type="button" data-action="explain">Explain</button><span class="sep" aria-hidden="true">·</span><button type="button" data-action="ask">Ask</button>
+  </div>
+  <script src="vendor/katex/katex.min.js"></script>
+  <script src="common.js"></script>
+  <script src="reader.js"></script>
+</body>
+</html>
