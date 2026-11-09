@@ -19,9 +19,17 @@ final class PaperreadsAppDelegate: NSObject, NSApplicationDelegate {
         keyMonitor = NSEvent.addLocalMonitorForEvents(matching: .keyDown) { event in
             let mods = event.modifierFlags.intersection(.deviceIndependentFlagsMask)
             guard mods == .command, event.charactersIgnoringModifiers == "=" else { return event }
-            // Local monitors run on the main thread.
-            MainActor.assumeIsolated { ReaderPreferences.shared.increase() }
-            return nil
+            // Local monitors run on the main thread. Only act in the main window while the
+            // text reader is showing (as the menu item does); otherwise pass the key on.
+            // Not the Settings window (SwiftUI names it "com_apple_SwiftUI_Settings_window").
+            let inMainWindow = event.window.map { !($0.identifier?.rawValue.contains("Settings") ?? false) } ?? false
+            let handled = MainActor.assumeIsolated { () -> Bool in
+                let prefs = ReaderPreferences.shared
+                guard inMainWindow, AppCommands.shared.canResizeReaderText, prefs.canIncrease else { return false }
+                prefs.increase()
+                return true
+            }
+            return handled ? nil : event
         }
     }
 

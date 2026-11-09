@@ -55,7 +55,9 @@ struct NotesPanel: View {
         }
         .onDisappear {
             saveNow()
-            flushFileAsync()
+            // Synchronous: closing the last window quits the app, and a detached flush could
+            // be cut off before it runs (the willTerminate observer below is already gone).
+            flushFileSync(onlyIfPending: true)
         }
         // ⌘Q inside the debounce window: flush synchronously before the process exits.
         .onReceive(NotificationCenter.default.publisher(for: NSApplication.willTerminateNotification)) { _ in
@@ -74,18 +76,25 @@ struct NotesPanel: View {
         NotesFiles.snapshot(of: paper, highlights: highlights)
     }
 
+    /// Touching a deleted SwiftData model can trap (and would write a stray file for it).
+    private var isPaperAlive: Bool {
+        !paper.isDeleted && paper.modelContext != nil
+    }
+
     private func scheduleFileWrite() {
         fileTask?.cancel()
         fileTask = Task { @MainActor in
             try? await Task.sleep(nanoseconds: 1_000_000_000)
             guard !Task.isCancelled else { return }
             fileTask = nil
+            guard isPaperAlive else { return }
             syncFile(allowPull: true)
         }
     }
 
     /// Reconcile with the file off the main actor; apply the outcome back here.
     private func syncFile(allowPull: Bool, then: ((URL?) -> Void)? = nil) {
+        guard isPaperAlive else { then?(nil); return }
         let snap = fileSnapshot
         Task { @MainActor in
             let outcome = await NotesFiles.sync(snap, allowPull: allowPull)
@@ -94,17 +103,11 @@ struct NotesPanel: View {
         }
     }
 
-    private func flushFileAsync() {
-        guard fileTask != nil else { return }
+    private func flushFileSync(onlyIfPending: Bool = false) {
+        if onlyIfPending, fileTask == nil { return }
         fileTask?.cancel()
         fileTask = nil
-        let snap = fileSnapshot
-        Task.detached(priority: .utility) { _ = await NotesFiles.sync(snap, allowPull: false) }
-    }
-
-    private func flushFileSync() {
-        fileTask?.cancel()
-        fileTask = nil
+        guard isPaperAlive else { return }
         NotesFiles.flushSync(fileSnapshot)
     }
 
@@ -117,9 +120,12 @@ struct NotesPanel: View {
             fileURL = url
             fileError = nil
             // Only adopt the file's text if nothing was typed while we were reading it.
-            if paper.paperNotes == requestedNotes, paper.paperNotes != notes {
-                paper.paperNotes = notes
-                fileNotice = "Updated from \(url.lastPathComponent), edited outside Paperreads."
+            if paper.paperNotes == requestedNotes || paper.paperNotes == notes {
+                if paper.paperNotes != notes {
+                    paper.paperNotes = notes
+                    fileNotice = "Updated from \(url.lastPathComponent), edited outside Paperreads."
+                }
+                NotesFiles.confirmPulled(id: paper.id, notes: notes, url: url)
             }
         case .conflict(let url, let backup):
             fileURL = url

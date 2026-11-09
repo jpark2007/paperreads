@@ -234,7 +234,13 @@
     return true;
   }
 
-  function releaseHold() { hold = null; }
+  /** Ends a hold; re-measures so later layout changes anchor on where the reader now is
+   * (not on pre-load/pre-prefs geometry). */
+  function releaseHold() {
+    if (!hold) return;
+    hold = null;
+    lastKnown = blocks.length ? measureAnchor() : null;
+  }
 
   function updateProgress() {
     if (!progressBar) return;

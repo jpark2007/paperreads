@@ -152,6 +152,8 @@ struct MarkdownEditor: NSViewRepresentable {
         /// The last value we pushed to (or received from) the binding.
         var lastSynced: String = ""
         var isApplyingExternal = false
+        /// Edited range whose styling was deferred while IME marked text was active.
+        var pendingStyleRange: NSRange?
 
         init(_ parent: MarkdownEditor) { self.parent = parent }
 
@@ -180,6 +182,12 @@ struct MarkdownEditor: NSViewRepresentable {
         func textStorage(_ textStorage: NSTextStorage, willProcessEditing editedMask: NSTextStorageEditActions,
                          range editedRange: NSRange, changeInLength delta: Int) {
             guard editedMask.contains(.editedCharacters) else { return }
+            // Restyling resets attributes, which would wipe the IME composition underline;
+            // defer until the marked text is committed (see textDidChange). style() clamps.
+            if let tv = textView, tv.hasMarkedText() {
+                pendingStyleRange = pendingStyleRange.map { NSUnionRange($0, editedRange) } ?? editedRange
+                return
+            }
             MarkdownStyler.style(textStorage, range: editedRange)
         }
 
@@ -187,6 +195,10 @@ struct MarkdownEditor: NSViewRepresentable {
 
         func textDidChange(_ notification: Notification) {
             guard let tv = notification.object as? NSTextView else { return }
+            if let p = pendingStyleRange, !tv.hasMarkedText(), let storage = tv.textStorage {
+                pendingStyleRange = nil
+                MarkdownStyler.style(storage, range: p)
+            }
             let s = tv.string
             lastSynced = s
             if !isApplyingExternal, parent.text != s { parent.text = s }

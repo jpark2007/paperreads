@@ -9,9 +9,10 @@ import SwiftData
 //
 // File: "<sanitized title, ≤80 chars> [<first 8 of uuid>].md". The "[xxxxxxxx].md" suffix is the
 // stable key: a title change renames the existing file. The "## Notes" section is two-way —
-// if the file was edited externally (mtime newer than our last write and the Notes section
+// if the file was edited externally (its hash differs from our last write and the Notes section
 // differs from what we wrote) the external text is pulled back into `Paper.paperNotes`.
-// The "## Highlights" section is always regenerated.
+// The "## Highlights" section is always regenerated; edits outside "## Notes" are kept as a
+// conflict copy before being overwritten.
 //
 // All disk IO runs on one private serial queue (value snapshots in, value outcomes out), so the
 // main actor never blocks except for the explicit synchronous flush at app termination.
@@ -134,6 +135,13 @@ enum NotesFiles {
         }
     }
 
+    /// The caller adopted a `.pulled` result as `paper.paperNotes`: record the file's Notes
+    /// text as the new baseline so the next in-app edit isn't mistaken for a conflict.
+    static func confirmPulled(id: UUID, notes: String, url: URL) {
+        let folder = self.folder
+        IO.queue.async { IO.shared.confirmPulled(id: id, notes: notes, url: url, folder: folder) }
+    }
+
     /// Synchronous flush (app termination). Never pulls; never clobbers an external edit.
     static func flushSync(_ snapshot: Snapshot) {
         let folder = self.folder
@@ -208,6 +216,10 @@ enum NotesFiles {
         if s.count > 80 {
             s = String(s.prefix(80)).trimmingCharacters(in: .whitespacesAndNewlines)
         }
+        // APFS caps a name at 255 UTF-8 bytes; leave room for " [xxxxxxxx].md" and a
+        // " conflict <date> N" suffix. Drop whole Characters so clusters are never split.
+        while s.utf8.count > 180 { s.removeLast() }
+        s = s.trimmingCharacters(in: .whitespacesAndNewlines)
         // Avoid a trailing dot before " [id].md" looking odd / confusing some sync tools.
         while s.hasSuffix(".") { s.removeLast() }
         return s.isEmpty ? "Untitled" : s
@@ -243,7 +255,9 @@ enum NotesFiles {
 
     /// Lines of generated (non-user) text that could be mistaken for structure are escaped.
     private static func escapeGeneratedLine(_ line: String) -> String {
-        if line.hasPrefix("#") || line.hasPrefix(">") || line.hasPrefix("---") { return "\\" + line }
+        // Match on the trimmed line: the parser trims before matching headings.
+        let t = line.drop(while: { $0 == " " || $0 == "\t" })
+        if t.hasPrefix("#") || t.hasPrefix(">") || t.hasPrefix("---") { return "\\" + line }
         return line
     }
 
@@ -291,8 +305,17 @@ enum NotesFiles {
     /// The section ends at the LAST "## Highlights" line (generated text never contains one,
     /// so user notes may safely contain their own "## Highlights" heading above it).
     static func notesSection(of markdown: String) -> String? {
+        guard let (all, notesIdx, stop) = notesBounds(of: markdown) else { return nil }
+        var lines = Array(all[(notesIdx + 1)..<stop])
+        // Drop the blank line(s) right after the heading that we emit.
+        while let first = lines.first, first.trimmingCharacters(in: .whitespaces).isEmpty { lines.removeFirst() }
+        return normalizedNotes(lines.joined(separator: "\n"))
+    }
+
+    /// Lines of the file plus the "## Notes" heading index and the (exclusive) end of its body.
+    private static func notesBounds(of markdown: String) -> ([String], Int, Int)? {
         let text = markdown.replacingOccurrences(of: "\r\n", with: "\n")
-        var lines = text.components(separatedBy: "\n")
+        let lines = text.components(separatedBy: "\n")
         // Skip YAML front matter.
         var start = 0
         if lines.first == "---", let end = lines.dropFirst().firstIndex(of: "---") { start = end + 1 }
@@ -300,10 +323,15 @@ enum NotesFiles {
         else { return nil }
         let endIdx = lines.lastIndex(where: { $0.trimmingCharacters(in: .whitespaces) == "## Highlights" })
         let stop = (endIdx.map { $0 > notesIdx ? $0 : lines.count }) ?? lines.count
-        lines = Array(lines[(notesIdx + 1)..<stop])
-        // Drop the blank line(s) right after the heading that we emit.
-        while let first = lines.first, first.trimmingCharacters(in: .whitespaces).isEmpty { lines.removeFirst() }
-        return normalizedNotes(lines.joined(separator: "\n"))
+        return (lines, notesIdx, stop)
+    }
+
+    /// Hash of everything in the file EXCEPT the Notes body (front matter, title, highlights,
+    /// trailing text). Lets reconcile tell an edit outside "## Notes" from a Notes edit.
+    static func restHash(of markdown: String) -> String? {
+        guard let (lines, notesIdx, stop) = notesBounds(of: markdown) else { return nil }
+        let rest = lines[...notesIdx] + ["\u{0}"] + lines[stop...]
+        return hash(rest.joined(separator: "\n"))
     }
 
     static func hash(_ s: String) -> String {
@@ -322,6 +350,8 @@ enum NotesFiles {
             var contentHash: String
             var notesHash: String
             var mtime: Date
+            /// `restHash(of:)` of what we last wrote (nil in indexes from older builds).
+            var restHash: String?
         }
 
         private var index: [String: Entry]?   // paperId → entry; loaded lazily on the queue
@@ -359,17 +389,45 @@ enum NotesFiles {
 
         /// Locate this paper's existing file in `folder` (index first, then a suffix scan).
         private func existingFile(for s: Snapshot, entry: Entry?, folder: URL, expected: URL) -> URL? {
+            let suffix = NotesFiles.suffix(for: s.id)
+            let names = (try? fm.contentsOfDirectory(atPath: folder.path)) ?? []
+            let candidates = names.filter { $0.hasSuffix(suffix) && !$0.hasPrefix(".") }
+                .map { folder.appendingPathComponent($0) }
+                .filter(exists)
+            // Several files carry this paper's id (e.g. an editor re-saved the pre-rename
+            // path): use the most recently modified one so its edits aren't ignored.
+            if candidates.count > 1 {
+                return candidates.max { a, b in
+                    let ma = mtime(a) ?? .distantPast, mb = mtime(b) ?? .distantPast
+                    if ma != mb { return ma < mb }
+                    return a.lastPathComponent != expected.lastPathComponent   // tie → expected
+                }
+            }
             if exists(expected) { return expected }
             if let e = entry, e.folder == folder.path {
                 let u = folder.appendingPathComponent(e.filename)
                 if exists(u) { return u }
             }
-            let suffix = NotesFiles.suffix(for: s.id)
-            let names = (try? fm.contentsOfDirectory(atPath: folder.path)) ?? []
-            if let name = names.filter({ $0.hasSuffix(suffix) && !$0.hasPrefix(".") }).sorted().first {
-                return folder.appendingPathComponent(name)
+            return candidates.first
+        }
+
+        func confirmPulled(id: UUID, notes: String, url: URL, folder: URL) {
+            var idx = loadIndex()
+            let key = id.uuidString
+            guard var e = idx[key], e.folder == folder.path,
+                  let data = try? Data(contentsOf: url), let text = String(data: data, encoding: .utf8),
+                  let n = NotesFiles.notesSection(of: text),
+                  n == NotesFiles.normalizedNotes(notes) else { return }
+            e.notesHash = NotesFiles.hash(n)
+            e.filename = url.lastPathComponent
+            e.mtime = mtime(url) ?? e.mtime
+            // Only take the whole file as baseline if nothing outside Notes changed too;
+            // otherwise the next write still sees (and backs up) that outside edit.
+            if let r = e.restHash, NotesFiles.restHash(of: text) == r {
+                e.contentHash = NotesFiles.hash(text)
             }
-            return nil
+            idx[key] = e
+            saveIndex(idx)
         }
 
         func reconcile(_ s: Snapshot, folder: URL, allowPull: Bool) -> Outcome {
@@ -386,6 +444,7 @@ enum NotesFiles {
             let expected = folder.appendingPathComponent(NotesFiles.fileName(for: s))
             let content = NotesFiles.render(s)
             let contentHash = NotesFiles.hash(content)
+            let contentRestHash = NotesFiles.restHash(of: content)
             let currentNotes = NotesFiles.normalizedNotes(s.notes)
             let currentNotesHash = NotesFiles.hash(currentNotes)
 
@@ -393,8 +452,14 @@ enum NotesFiles {
             var backupURL: URL?
 
             if let existing = existingFile(for: s, entry: entry, folder: folder, expected: expected) {
-                let diskData = try? Data(contentsOf: existing)
-                let diskText = diskData.flatMap { String(data: $0, encoding: .utf8) }
+                let diskData: Data
+                do {
+                    diskData = try Data(contentsOf: existing)
+                } catch {
+                    // Unknown contents (evicted iCloud file, lock, I/O error): never overwrite.
+                    return .failed("Couldn't read \(existing.lastPathComponent) (\(error.localizedDescription))")
+                }
+                let diskText = String(data: diskData, encoding: .utf8)
                 let diskHash = diskText.map(NotesFiles.hash)
 
                 // Was the file changed by someone other than us since our last write?
@@ -403,13 +468,24 @@ enum NotesFiles {
                 // Edited externally in a way we can't parse (e.g. the "## Notes" heading removed):
                 // never pull, but never silently overwrite either — keep a copy first.
                 var unparseableEdit = false
+                // Text outside "## Notes" (front matter, highlights, trailing text) was edited:
+                // it is regenerated on write, so keep a copy before overwriting it.
+                var outsideEdit = false
                 if let diskText {
                     if let e = entry {
-                        let newer = (mtime(existing) ?? .distantPast).timeIntervalSince(e.mtime) > 0.5
-                        if newer && diskHash != e.contentHash {
+                        // The hash alone proves the file isn't what we wrote (mtime can be
+                        // preserved/restored by sync tools, Time Machine, cp -p…).
+                        if diskHash != e.contentHash, diskHash != contentHash {
                             externalNotes = NotesFiles.notesSection(of: diskText)
                             if let n = externalNotes {
                                 if NotesFiles.hash(n) != e.notesHash { externallyChanged = true }
+                                if let r = e.restHash {
+                                    outsideEdit = NotesFiles.restHash(of: diskText) != r
+                                } else {
+                                    // Older index: no record of the rest; a change that isn't
+                                    // in Notes must be outside it.
+                                    outsideEdit = !externallyChanged
+                                }
                             } else {
                                 unparseableEdit = true
                             }
@@ -424,13 +500,13 @@ enum NotesFiles {
                         unparseableEdit = true
                     }
                 } else {
-                    // Not UTF-8 / unreadable: preserve whatever is there before writing.
-                    unparseableEdit = diskData != nil
+                    // Not UTF-8: preserve whatever is there before writing.
+                    unparseableEdit = true
                 }
                 // The app already adopted the external text (a previous `.pulled`): no conflict.
                 if externallyChanged, externalNotes == currentNotes { externallyChanged = false }
 
-                if unparseableEdit {
+                if unparseableEdit || (outsideEdit && !externallyChanged) {
                     let backup = conflictURL(for: existing)
                     do {
                         try fm.copyItem(at: existing, to: backup)
@@ -445,7 +521,8 @@ enum NotesFiles {
                     else { appChanged = !currentNotes.isEmpty }
 
                     if !appChanged {
-                        // External editor wins.
+                        // External editor wins. (An outside-Notes edit is still caught and backed
+                        // up by the next write: confirmPulled keeps the old content baseline.)
                         if allowPull { return .pulled(notes: ext, url: existing) }
                         return .deferred(existing)
                     }
@@ -477,7 +554,8 @@ enum NotesFiles {
                    let diskHash, diskHash == contentHash {
                     let m = mtime(target) ?? Date()
                     idx[key] = Entry(folder: folder.path, filename: target.lastPathComponent,
-                                     contentHash: contentHash, notesHash: currentNotesHash, mtime: m)
+                                     contentHash: contentHash, notesHash: currentNotesHash, mtime: m,
+                                     restHash: contentRestHash)
                     saveIndex(idx)
                     return .synced(target)
                 }
@@ -490,7 +568,7 @@ enum NotesFiles {
             }
             idx[key] = Entry(folder: folder.path, filename: target.lastPathComponent,
                              contentHash: contentHash, notesHash: currentNotesHash,
-                             mtime: mtime(target) ?? Date())
+                             mtime: mtime(target) ?? Date(), restHash: contentRestHash)
             saveIndex(idx)
             if let backupURL { return .conflict(url: target, backup: backupURL) }
             return .synced(target)

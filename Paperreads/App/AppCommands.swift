@@ -413,6 +413,9 @@ final class AppCommands: ObservableObject {
         }
     }
 
+    /// Text-size commands only make sense while the clean-text reader is showing.
+    var canResizeReaderText: Bool { session != nil && readerMode == .text }
+
     var canUseSelectionCommands: Bool {
         guard let session else { return false }
         return readerMode == .text && session.paper.importState == .ready
@@ -446,13 +449,13 @@ struct PaperreadsCommands: Commands {
             // ⌘= is also handled (PaperreadsAppDelegate), since ⌘+ needs Shift on most layouts.
             Button("Larger Text") { prefs.increase() }
                 .keyboardShortcut("+", modifiers: .command)
-                .disabled(!prefs.canIncrease)
+                .disabled(!app.canResizeReaderText || !prefs.canIncrease)
             Button("Smaller Text") { prefs.decrease() }
                 .keyboardShortcut("-", modifiers: .command)
-                .disabled(!prefs.canDecrease)
+                .disabled(!app.canResizeReaderText || !prefs.canDecrease)
             Button("Actual Size") { prefs.actualSize() }
                 .keyboardShortcut("0", modifiers: .command)
-                .disabled(prefs.isDefaultSize)
+                .disabled(!app.canResizeReaderText || prefs.isDefaultSize)
             Divider()
         }
 
