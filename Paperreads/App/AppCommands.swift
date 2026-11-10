@@ -283,6 +283,9 @@ final class AppCommands: ObservableObject {
         reprocess(session.paper, context: session.context)
     }
 
+    /// Closes the open paper and shows the library home page.
+    func showLibrary() { selectedPaperID = nil }
+
     /// Opens a session for `selectedPaperID`, cancelling the previous paper's chat.
     func syncSession(context: ModelContext) {
         if session?.paperID == selectedPaperID { return }
@@ -482,6 +485,9 @@ struct PaperreadsCommands: Commands {
         CommandGroup(replacing: .printItem) {}
 
         CommandGroup(after: .sidebar) {
+            Button("Library") { app.showLibrary() }
+                .keyboardShortcut("l", modifiers: [.command, .shift])
+                .disabled(app.session == nil)
             Button(app.sidePanelVisible ? "Hide Side Panel" : "Show Side Panel") { app.toggleSidePanel() }
                 .keyboardShortcut("j", modifiers: .command)
                 .disabled(app.session == nil)

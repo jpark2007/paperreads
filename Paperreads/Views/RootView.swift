@@ -52,7 +52,7 @@ struct RootView: View {
         if let session = app.session {
             PaperDetail(session: session)
         } else {
-            EmptyDetail()
+            LibraryHome()
         }
     }
 
@@ -93,6 +93,14 @@ private struct PaperDetail: View {
         }
         .background(Theme.bg)
         .toolbar {
+            ToolbarItem(placement: .navigation) {
+                Button {
+                    app.showLibrary()
+                } label: {
+                    Image(systemName: "books.vertical")
+                }
+                .help("Library (⇧⌘L)")
+            }
             ToolbarItem(placement: .primaryAction) {
                 Button {
                     app.toggleSidePanel()
@@ -105,36 +113,6 @@ private struct PaperDetail: View {
         .onChange(of: session.paper.importStateRaw) {
             session.importStateChanged()
         }
-    }
-}
-
-private struct EmptyDetail: View {
-    @EnvironmentObject private var app: AppCommands
-
-    var body: some View {
-        VStack(alignment: .leading, spacing: Theme.Space.m) {
-            Text("Paperreads").capsLabel()
-            Text("Pick a paper from the library,\nor add a new one.")
-                .font(.serif(28, weight: .semibold))
-                .foregroundStyle(Theme.ink)
-                .lineSpacing(4)
-            Text("Read papers as clean text with real equations, highlight what matters, and ask Claude about anything — grounded in the paper and the works it cites.")
-                .font(.serif(17))
-                .foregroundStyle(Theme.muted)
-                .lineSpacing(5)
-                .frame(maxWidth: 520, alignment: .leading)
-                .fixedSize(horizontal: false, vertical: true)
-            HStack(spacing: Theme.Space.m) {
-                Button("Add paper") { app.showImportSheet = true }
-                    .buttonStyle(.pill)
-                Button("Open PDF…") { app.showPDFImporter = true }
-                    .buttonStyle(.text)
-            }
-            .padding(.top, Theme.Space.s)
-        }
-        .padding(Theme.Space.xxl)
-        .frame(maxWidth: .infinity, maxHeight: .infinity)
-        .background(Theme.bg)
     }
 }
 
