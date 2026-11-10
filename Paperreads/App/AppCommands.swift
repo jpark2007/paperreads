@@ -247,6 +247,7 @@ final class AppCommands: ObservableObject {
         Importer.shared.onRedirect = { [weak self] from, to, message in
             self?.redirect(from: from, to: to, message: message)
         }
+        Importer.shared.onNotice = { [weak self] message in self?.flash(message) }
         Importer.recoverInterrupted(context: context)
         Importer.shared.resumeReferences(context: context)
     }

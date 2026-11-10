@@ -46,7 +46,7 @@
     'm', 'eq', 'eqn', 'tex-fallback', 'cite', 'xref', 'tag', 'sc', 'theorem', 'proof',
     'runin', 'note', 'fnref', 'biblist', 'bibitem', 'listing', 'line', 'algo', 'flexfig',
     'panel', 'fig', 'tbl', 'tabular', 'c', 'l', 'r', 'rt', 'rb', 'tagged', 'ack', 'abstract',
-    'pre-wrap', 'box', 'box-title', 'diagram',
+    'pre-wrap', 'box', 'box-title', 'diagram', 'm-alt',
   ]);
 
   const MAX_DEPTH = 160;
@@ -226,6 +226,7 @@
         case 'data-b': if (opts && opts.keepBlockIds && /^\d{1,7}$/.test(value)) out = value; break;
         case 'data-tex': if (value.length <= 20000) out = value; break;
         case 'data-d': if (value === '0' || value === '1') out = value; break;
+        case 'data-alt': if (tag === 'span') out = value.slice(0, 2000); break;
         case 'class': out = filterClasses(value) || null; break;
         case 'id': if (opts && opts.keepIds && value.length <= 256) out = value; break;
         default: break;
@@ -484,11 +485,14 @@
 
   function collapseTeX(tex) { return String(tex).replace(/\s+/g, ' ').trim(); }
 
-  function makeMathSpan(doc, tex, display) {
+  /** `alt` (optional): readable text of the formula, shown if KaTeX cannot parse the TeX. */
+  function makeMathSpan(doc, tex, display, alt) {
     const span = doc.createElement('span');
     span.className = 'm';
     span.setAttribute('data-tex', String(tex).trim());
     span.setAttribute('data-d', display ? '1' : '0');
+    const a = alt ? String(alt).replace(/\s+/g, ' ').trim() : '';
+    if (a) span.setAttribute('data-alt', a.slice(0, 2000));
     return span;
   }
 
@@ -592,7 +596,7 @@
     let html = katexTry(tex, display);
     if (html === null) {
       // LaTeXML-isms KaTeX rejects: array/tabular position argument (often empty "[]").
-      const fixed = tex.replace(/\\begin\{(array|tabular|aligned|split)\}\s*\[[^\]]*\]/g, '\\begin{$1}');
+      const fixed = fixColorModels(tex.replace(/\\begin\{(array|tabular|aligned|split)\}\s*\[[^\]]*\]/g, '\\begin{$1}'));
       html = katexTry(fixed, display);
       // Author macros LaTeXML left unexpanded in the alttext (e.g. \E for expectation):
       // draw each undefined letters-only macro as an upright operator name rather than
@@ -608,6 +612,24 @@
     if (renderCache.size >= RENDER_CACHE_MAX) renderCache.delete(renderCache.keys().next().value);
     renderCache.set(key, html);
     return html;
+  }
+
+  /**
+   * xcolor's model argument (\color[rgb]{0,0,1}, \textcolor[RGB]{…}{…}, [gray], [HTML]),
+   * which KaTeX rejects, → a plain #rrggbb colour.
+   */
+  function fixColorModels(tex) {
+    return tex.replace(/\\(color|textcolor|colorbox)\s*\[\s*(rgb|RGB|gray|HTML)\s*\]\s*\{([^{}]*)\}/g, (m, cmd, model, spec) => {
+      const nums = spec.split(',').map((x) => parseFloat(x));
+      const h2 = (v) => Math.max(0, Math.min(255, Math.round(v))).toString(16).padStart(2, '0');
+      let hex = null;
+      if (model === 'HTML' && /^\s*[0-9a-fA-F]{6}\s*$/.test(spec)) hex = spec.trim();
+      else if (model === 'gray' && nums.length === 1 && isFinite(nums[0])) hex = h2(nums[0] * 255).repeat(3);
+      else if (nums.length === 3 && nums.every(isFinite)) {
+        hex = nums.map((v) => h2(model === 'RGB' ? v : v * 255)).join('');
+      }
+      return '\\' + cmd + '{' + (hex ? '#' + hex : 'black') + '}';
+    });
   }
 
   function katexOptions(display, extra) {
@@ -649,8 +671,18 @@
     const tex = el.getAttribute('data-tex') || '';
     const display = el.getAttribute('data-d') === '1';
     const html = global.katex ? katexHTML(tex, display) : null;
+    const alt = el.getAttribute('data-alt');
     if (html !== null) {
       el.innerHTML = html; // KaTeX output with trust:false
+    } else if (alt) {
+      // TeX KaTeX can't parse (unexpanded macros, LaTeXML-isms): the formula's readable
+      // MathML text beats raw source.
+      const s = document.createElement('span');
+      s.className = 'm-alt';
+      s.textContent = alt;
+      s.title = tex.length > 300 ? tex.slice(0, 300) + '…' : tex;
+      el.textContent = '';
+      el.appendChild(s);
     } else {
       const code = document.createElement('code');
       code.className = 'tex-fallback';

@@ -54,6 +54,9 @@
 
   function hasClass(el, c) { return el.classList && el.classList.contains(c); }
 
+  /** LaTeXML's expanded pgf/TikZ code: never TeX anyone can (or should) read. */
+  const PGF_TEX_RE = /\\lxSVG@|\\pgfpicture|\\pgfsys@|\\endpgfpicture/;
+
   /** TeX source of a MathML element (LaTeXML puts it in alttext). */
   function mathTeX(math) {
     let tex = math.getAttribute('alttext');
@@ -62,7 +65,117 @@
       if (ann) tex = ann.textContent;
     }
     if (!tex) tex = math.textContent;
-    return String(tex || '').trim();
+    tex = String(tex || '').replace(/\\lx@inpgf@ignorespaces\s*/g, '').trim();
+    // A picture inside the formula: the alttext is kilobytes of pgf internals. Rebuild the
+    // TeX from the MathML presentation instead (pictures themselves are handled by callers).
+    if (PGF_TEX_RE.test(tex)) tex = mathmlToTeX(math);
+    return tex;
+  }
+
+  /** Readable text of a <math> (its MathML presentation), for when KaTeX cannot parse the TeX. */
+  function mathAlt(math) {
+    const c = math.cloneNode(true);
+    c.querySelectorAll('annotation, annotation-xml, img, svg, .box').forEach((n) => n.remove());
+    const parts = [];
+    (function walk(n) {
+      for (let k = n.firstChild; k; k = k.nextSibling) {
+        if (k.nodeType === 3) { parts.push(k.data); continue; }
+        if (k.nodeType !== 1) continue;
+        if (k.localName === 'mo') {
+          const t = collapse(k.textContent.replace(INVISIBLE_MATH_RE, ''));
+          parts.push(/^[=+−\-<>≤≥≈≡≔→↦⊗×∘∈⊂⊆:]=?$|^:=$/.test(t) ? ' ' + t + ' ' : t);
+          continue;
+        }
+        walk(k);
+        if (/^(mtd|mtr)$/.test(k.localName)) parts.push(' ');
+      }
+    })(c);
+    return collapse(parts.join('').replace(INVISIBLE_MATH_RE, '')).slice(0, 2000);
+  }
+
+  // MathML presentation → TeX, for formulas whose alttext is unusable (pictures inside).
+  const TEX_SPECIAL_RE = /[\\{}$%&#_^~]/g;
+  function texToken(s) {
+    return String(s).replace(INVISIBLE_MATH_RE, '').replace(TEX_SPECIAL_RE, (c) => (c === '\\' ? '\\backslash ' : c === '^' ? '\\hat{}' : c === '~' ? '\\sim ' : '\\' + c));
+  }
+  function mathmlToTeX(el) {
+    const kids = (n) => Array.from(n.children).filter((c) => !/^(annotation|annotation-xml)$/.test(c.localName));
+    const g = (n) => '{' + (n ? conv(n) : '') + '}';
+    function conv(n) {
+      const t = n.localName;
+      const k = kids(n);
+      switch (t) {
+        case 'mi': {
+          const s = collapse(n.textContent);
+          return s.length > 1 ? '\\mathrm{' + texToken(s) + '}' : texToken(s);
+        }
+        case 'mn': return texToken(collapse(n.textContent));
+        case 'mo': return texToken(collapse(n.textContent)) + ' ';
+        case 'mtext': {
+          const s = n.textContent.replace(INVISIBLE_MATH_RE, '');
+          return collapse(s) ? '\\text{' + texEscapeText(s) + '}' : '';
+        }
+        case 'mspace': return '\\,';
+        case 'msub': return g(k[0]) + '_' + g(k[1]);
+        case 'msup': return g(k[0]) + '^' + g(k[1]);
+        case 'msubsup': return g(k[0]) + '_' + g(k[1]) + '^' + g(k[2]);
+        case 'munder': return '\\underset' + g(k[1]) + g(k[0]);
+        case 'mover': return '\\overset' + g(k[1]) + g(k[0]);
+        case 'munderover': return '\\overset' + g(k[2]) + '{\\underset' + g(k[1]) + g(k[0]) + '}';
+        case 'mfrac': return '\\frac' + g(k[0]) + g(k[1]);
+        case 'msqrt': return '\\sqrt{' + k.map(conv).join('') + '}';
+        case 'mroot': return '\\sqrt[' + (k[1] ? conv(k[1]) : '') + ']' + g(k[0]);
+        case 'mtable':
+          return '\\begin{matrix}' + k.map((r) => kids(r).map((c) => conv(c)).join(' & ')).join(' \\\\ ') + '\\end{matrix}';
+        case 'mtr': case 'mlabeledtr': return k.map(conv).join(' & ');
+        case 'semantics': return k.length ? conv(k[0]) : '';
+        case 'img': case 'svg': return '';
+        default: return k.map(conv).join('');
+      }
+    }
+    return conv(el).replace(/\s+/g, ' ').trim();
+  }
+
+  /** Pictures LaTeXML drew inside a formula (after convertPictures: img.diagram / div.box). */
+  function mathHasPicture(math) { return !!math.querySelector('img, svg, div.box'); }
+
+  /**
+   * A formula with pictures inside, as a sequence of TeX runs and the (already converted)
+   * picture nodes: [{tex}|{node}]. The TeX of each run is rebuilt from MathML.
+   */
+  function splitPictureMath(math) {
+    const items = [];
+    let run = [];
+    const flush = () => {
+      const tex = run.join('').replace(/\s+/g, ' ').trim();
+      run = [];
+      if (tex) items.push({ tex: tex });
+    };
+    (function walk(n) {
+      for (let c = n.firstElementChild; c; c = c.nextElementSibling) {
+        const t = c.localName;
+        if (t === 'annotation' || t === 'annotation-xml') continue;
+        if (t === 'img' || t === 'svg' || (t === 'div' && hasClass(c, 'box'))) {
+          flush();
+          items.push({ node: c });
+          continue;
+        }
+        if (mathHasPicture(c)) { walk(c); continue; }
+        run.push(mathmlToTeX(c) + ' ');
+      }
+    })(math);
+    flush();
+    return items;
+  }
+
+  /** `items` from splitPictureMath → inline content: math spans and the pictures. */
+  function pictureMathFragment(doc, items, display) {
+    const frag = doc.createDocumentFragment();
+    items.forEach((it) => {
+      if (it.node) frag.appendChild(it.node);
+      else frag.appendChild(P.makeMathSpan(doc, (display ? '\\displaystyle ' : '') + it.tex, false));
+    });
+    return frag;
   }
 
   /** Plain text with <br> and block boundaries as newlines (for author parsing). */
@@ -277,6 +390,17 @@
    */
   function isBoxPicture(svg, fos) {
     if (!fos.length || fos.length > 4) return false;
+    // Pictures inside formulas (ZX diagrams, tikz-cd squares, tree symbols) are drawings.
+    if (hasClass(svg, 'ltx_markedasmath') ||
+        svg.closest('math, table.ltx_equation, table.ltx_equationgroup, table.ltx_eqn_table, .ltx_eqn_table, .ltx_equationgroup')) return false;
+    // TikZ matrices (commutative diagrams) are laid-out nodes, not running text.
+    if (svg.querySelector('g.ltx_tikzmatrix')) return false;
+    // Several labels that are each only a formula: node and arrow labels of a diagram.
+    if (fos.length >= 2 && fos.every((f) => {
+      const c = f.cloneNode(true);
+      c.querySelectorAll('math').forEach((m) => m.remove());
+      return f.querySelector('math') && !collapse(c.textContent);
+    })) return false;
     const width = svgLength(svg, 'width', 2);
     const widest = Math.max.apply(null, fos.map((f) => parseFloat(f.getAttribute('width')) || 0));
     if (!(width > 0)) return true;
@@ -532,29 +656,48 @@
         const tagEl = tr.querySelector('.ltx_tag_equation, .ltx_eqn_eqno .ltx_tag');
         const number = tagEl ? collapse(tagEl.textContent) : '';
         const pieces = [];
+        const alts = [];
         (function walk(n) {
           for (let c = n.firstChild; c; c = c.nextSibling) {
             if (c.nodeType === 3) {
               const t = collapse(c.data);
-              if (t) pieces.push('\\text{ ' + texEscapeText(t) + ' }');
+              if (t) { pieces.push('\\text{ ' + texEscapeText(t) + ' }'); alts.push(t); }
             } else if (c.nodeType === 1) {
-              if (c.localName === 'math') { pieces.push(mathTeX(c)); continue; }
+              if (c.localName === 'math') {
+                if (mathHasPicture(c)) splitPictureMath(c).forEach((it) => pieces.push(it.node ? it : it.tex));
+                else { pieces.push(mathTeX(c)); alts.push(mathAlt(c)); }
+                continue;
+              }
+              if (c.localName === 'img' || (c.localName === 'div' && hasClass(c, 'box'))) { pieces.push({ node: c }); continue; }
               if (hasClass(c, 'ltx_eqn_eqno') || hasClass(c, 'ltx_tag_equation') || hasClass(c, 'ltx_tag')) continue;
               if (hasClass(c, 'ltx_note')) continue;
               walk(c);
             }
           }
         })(tr);
-        const tex = pieces.filter(Boolean).join(' ').trim();
+        const mixed = pieces.some((x) => typeof x !== 'string');
+        const tex = mixed ? '' : pieces.filter(Boolean).join(' ').trim();
         const body = tr.parentNode;
         const rowId = tr.getAttribute('id') ||
           (body && (body.localName === 'tbody' || body.localName === 'span') && body !== table &&
             body.firstElementChild === tr ? body.getAttribute('id') || '' : '');
+        if (mixed) {
+          // pictures in the row: TeX runs and images side by side
+          const items = [];
+          pieces.forEach((x) => {
+            if (typeof x !== 'string') { items.push(x); return; }
+            if (!x) return;
+            const last = items[items.length - 1];
+            if (last && !last.node) last.tex += ' ' + x; else items.push({ tex: x });
+          });
+          out.push({ items: items, number: number, id: rowId });
+          return;
+        }
         if (!tex) {
           if (number && out.length && !out[out.length - 1].number) out[out.length - 1].number = number;
           return;
         }
-        out.push({ tex: tex, number: number, id: rowId });
+        out.push({ tex: tex, alt: collapse(alts.join(' ')).slice(0, 2000), number: number, id: rowId });
       });
       const frag = doc.createDocumentFragment();
       out.forEach((eq, i) => {
@@ -562,7 +705,13 @@
         div.className = 'eq';
         const id = eq.id || (i === 0 ? table.getAttribute('id') : '');
         if (id) div.setAttribute('id', id);
-        div.appendChild(P.makeMathSpan(doc, eq.tex, true));
+        if (eq.items) {
+          const line = doc.createElement('span');
+          line.appendChild(pictureMathFragment(doc, eq.items, true));
+          div.appendChild(line);
+        } else {
+          div.appendChild(P.makeMathSpan(doc, eq.tex, true, eq.alt));
+        }
         if (eq.number) {
           const n = doc.createElement('span');
           n.className = 'eqn';
@@ -590,9 +739,22 @@
     const doc = root.ownerDocument;
     Array.from(root.querySelectorAll('math')).forEach((m) => {
       if (!m.isConnected || !m.parentNode) return;
-      const tex = mathTeX(m);
       const display = (m.getAttribute('display') || '').toLowerCase() === 'block';
-      const span = P.makeMathSpan(doc, tex, display);
+      if (mathHasPicture(m)) {
+        const holder = doc.createElement(display ? 'div' : 'span');
+        if (display) holder.className = 'eq';
+        const id = m.getAttribute('id');
+        if (id) holder.setAttribute('id', id);
+        const inner = doc.createElement('span');
+        inner.appendChild(pictureMathFragment(doc, splitPictureMath(m), display));
+        holder.appendChild(inner);
+        const p = display && m.closest('p');
+        if (p && root.contains(p)) splitParagraphAround(p, m, holder);
+        else m.parentNode.replaceChild(holder, m);
+        return;
+      }
+      const tex = mathTeX(m);
+      const span = P.makeMathSpan(doc, tex, display, mathAlt(m));
       const id = m.getAttribute('id');
       if (id) span.setAttribute('id', id);
       m.parentNode.replaceChild(span, m);
@@ -736,6 +898,8 @@
     '.ltx_role_pagestyle', '.ltx_role_newpage', '.ltx_role_footnotetext', '.ltx_role_affiliationtext',
     '.ltx_role_keywords_head', '#header', '#footer', '.arxiv-watermark',
     '.sr-only', '.html-header-message', '.html-header-logo',
+    // lstlisting's "download this listing" link (a ⬇ glyph + data: URL)
+    '.ltx_listing_data',
   ].join(', ');
 
   function fromArxivHTML(html, baseURL) {
@@ -831,6 +995,16 @@
         if (el.querySelector('img, span.m, br, table, td')) return;
         if (el.hasAttribute('id') && el.localName !== 'span') { if (collapse(el.textContent)) return; }
         if (collapse(el.textContent) === '') {
+          // Whitespace-only inline elements are spacing: lstlisting writes every space and
+          // indent run as <span class="ltx_lst_space"> </span>. Keep the whitespace itself
+          // (verbatim inside code, one space elsewhere) so words don't run together.
+          const raw = el.textContent;
+          if (raw && /^(span|em|strong|i|b|cite|sub|sup)$/.test(el.localName)) {
+            const verbatim = el.closest('.listing, .line, pre, code');
+            el.parentNode.replaceChild(el.ownerDocument.createTextNode(verbatim ? raw : ' '), el);
+            changed = true;
+            return;
+          }
           if (el.hasAttribute('id') && el.parentNode && !el.parentNode.hasAttribute('id')) {
             el.parentNode.setAttribute('id', el.getAttribute('id'));
           }

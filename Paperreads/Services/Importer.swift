@@ -29,6 +29,10 @@ enum ImportError: LocalizedError {
     case noExtractableText(String?)
     /// Internal: the paper was a duplicate and was folded into the existing one.
     case merged
+    /// arXiv's HTML text could not be fetched (network error, timeout, 429/5xx).
+    case arxivUnreachable
+    /// Reprocess could only have produced lower-fidelity text than the paper already has.
+    case wouldDowngrade(String?)
 
     var errorDescription: String? {
         switch self {
@@ -60,6 +64,12 @@ enum ImportError: LocalizedError {
             return reason + " " + base
         case .merged:
             return "This paper is already in your library."
+        case .arxivUnreachable:
+            return "arXiv's HTML text couldn't be fetched right now."
+        case .wouldDowngrade(let reason):
+            let base = "Reprocess could only produce lower-quality text, so the existing text was kept."
+            guard let reason, !reason.isEmpty else { return base }
+            return reason + " " + base
         }
     }
 }
@@ -117,6 +127,16 @@ enum ArxivID {
     static func findStamp(_ text: String) -> String? {
         find(text, patterns: [#"arXiv:(\d{4}\.\d{4,5})(v\d+)?\s*\[[A-Za-z][A-Za-z.\-]{0,30}\]"#,
                               #"arXiv:([a-z]+(?:-[a-z]+)?(?:\.[A-Z]{2})?/\d{7})(v\d+)?\s*\[[A-Za-z][A-Za-z.\-]{0,30}\]"#])
+    }
+
+    /// The full arXiv margin stamp as arXiv prints it: id WITH version, category, and date
+    /// ("arXiv:2401.12345v2 [cs.CL] 3 Jan 2024"). References and footnotes in Zotero/Mendeley
+    /// style ("arXiv:2106.09685 [cs]") lack the version + date, so this form is safe to trust
+    /// anywhere on the page.
+    static func findDatedStamp(_ text: String) -> String? {
+        let date = #"\s*\d{1,2}\s+(?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)[a-z]*\.?\s+\d{4}"#
+        return find(text, patterns: [#"arXiv:(\d{4}\.\d{4,5})(v\d+)\s*\[[A-Za-z][A-Za-z.\-]{0,30}\]"# + date,
+                                     #"arXiv:([a-z]+(?:-[a-z]+)?(?:\.[A-Z]{2})?/\d{7})(v\d+)\s*\[[A-Za-z][A-Za-z.\-]{0,30}\]"# + date])
     }
 
     /// The first "arXiv:XXXX.XXXXX(vN)" anywhere in the text. May be a cited preprint, so the
@@ -279,6 +299,16 @@ final class Importer: ObservableObject {
     private var provisionalTitles: Set<UUID> = []
     /// Papers being reprocessed: identity is re-checked and saved conversions are not reused.
     private var reprocessing: Set<UUID> = []
+    /// What a reprocessed paper had before (text kind, status detail): a failed Reprocess
+    /// restores it instead of hiding intact text behind "Import failed", and Reprocess never
+    /// replaces text with a lower-fidelity kind.
+    private var reprocessPrior: [UUID: (kind: ContentKind, detail: String?)] = [:]
+    /// Papers identified only by weak evidence (an arXiv mention, a DOI in the text, a title
+    /// search): never auto-merged into an existing paper on that identity.
+    private var weakIdentity: Set<UUID> = []
+
+    /// Short user-facing notice (e.g. "Reprocess failed — kept the existing text").
+    var onNotice: ((String) -> Void)?
 
     /// Called when an import turned out to be a paper already in the library (or when a
     /// redundant failed copy is removed): `from` is about to be deleted, `to` is the paper to
@@ -422,6 +452,11 @@ final class Importer: ObservableObject {
         if refCurrent?.id == id { refCurrent?.task.cancel() }
         markTitleProvisionalIfUnidentified(paper)
         reprocessing.insert(id)
+        if paper.importState == .ready, paper.contentKind != .none, Self.hasContentFiles(id) {
+            reprocessPrior[id] = (paper.contentKind, paper.importStatusDetail)
+        } else {
+            reprocessPrior[id] = nil
+        }
         paper.importState = .queued
         paper.importStatusDetail = "Waiting…"
         save(context)
@@ -437,6 +472,8 @@ final class Importer: ObservableObject {
     /// Stops any queued or running work for a paper (call before deleting it).
     func cancel(_ paperId: UUID) {
         reprocessing.remove(paperId)
+        reprocessPrior[paperId] = nil
+        weakIdentity.remove(paperId)
         queue.removeAll { $0.id == paperId }
         refQueue.removeAll { $0.id == paperId }
         if current?.id == paperId { current?.task.cancel() }
@@ -469,15 +506,27 @@ final class Importer: ObservableObject {
         }
     }
 
-    /// On launch: papers left in a busy state by a previous run are marked failed.
+    /// Whether a paper's clean text (content.html + blocks.json) is on disk.
+    nonisolated static func hasContentFiles(_ id: UUID) -> Bool {
+        let fm = FileManager.default
+        return fm.fileExists(atPath: PaperStore.htmlURL(id).path) && fm.fileExists(atPath: PaperStore.blocksURL(id).path)
+    }
+
+    /// On launch: papers left in a busy state by a previous run are marked failed — except
+    /// those that already had text (an interrupted Reprocess), which go back to ready.
     @MainActor
     static func recoverInterrupted(context: ModelContext) {
         guard let papers = try? context.fetch(FetchDescriptor<Paper>()) else { return }
         var changed = false
         for p in papers {
             if p.importState.isBusy {
-                p.importState = .failed
-                p.importStatusDetail = "Interrupted — Retry"
+                if p.contentKind != .none, hasContentFiles(p.id) {
+                    p.importState = .ready
+                    p.importStatusDetail = nil
+                } else {
+                    p.importState = .failed
+                    p.importStatusDetail = "Interrupted — Retry"
+                }
                 changed = true
             }
             if p.referencesState == .fetching {
@@ -532,7 +581,11 @@ final class Importer: ObservableObject {
 
     private func run(_ job: Job) async {
         let ctx = job.context
-        defer { reprocessing.remove(job.id) }
+        defer {
+            reprocessing.remove(job.id)
+            reprocessPrior[job.id] = nil
+            weakIdentity.remove(job.id)
+        }
         do {
             try await pipeline(job.id, ctx)
             if paper(job.id, ctx) != nil { enqueueReferences(job) }
@@ -542,6 +595,23 @@ final class Importer: ObservableObject {
         } catch {
             guard let p = paper(job.id, ctx) else {
                 cleanupOrphanDirectory(job.id, ctx)
+                return
+            }
+            // The paper still has its earlier text (a failed or cancelled Reprocess): keep it
+            // readable and say why nothing changed.
+            if p.contentKind != .none, Self.hasContentFiles(job.id) {
+                let prior = reprocessPrior[job.id]
+                p.importState = .ready
+                p.importStatusDetail = prior?.detail
+                save(ctx)
+                if !(error is CancellationError || Task.isCancelled) {
+                    let why = Self.message(for: error)
+                    if case ImportError.wouldDowngrade = error {
+                        onNotice?(why)
+                    } else {
+                        onNotice?("Reprocess failed — the existing text was kept. " + why)
+                    }
+                }
                 return
             }
             p.importState = .failed
@@ -607,6 +677,9 @@ final class Importer: ObservableObject {
                     p.arxivId = ax
                     p.sourceURL = "https://arxiv.org/abs/\(ax)"
                 }
+                // Only the PDF's own stamp/metadata is strong enough to fold it into an
+                // existing paper; a mention or a title search may be a different document.
+                if !r.isStrong { weakIdentity.insert(id) }
             }
             if let h = hints { applyPDFHints(h, to: p) }
             save(ctx)
@@ -698,7 +771,19 @@ final class Importer: ObservableObject {
         }
 
         try update(id, ctx, .fetching, "Fetching arXiv text…")
-        if let (html, finalURL) = try await fetchArxivHTML(arxivId) {
+        // Reprocess of a paper that already has arXiv HTML text: anything the PDF route could
+        // produce is worse, so a failed HTML fetch/ingest keeps the existing text.
+        let keepHTML = reprocessing.contains(id) && reprocessPrior[id]?.kind == .arxivHTML
+        let fetched: (String, URL)?
+        do {
+            fetched = try await fetchArxivHTML(arxivId)
+        } catch ImportError.arxivUnreachable {
+            // Offline / timeout / 429 / 5xx is not "this paper has no HTML": never downgrade
+            // existing text because of it. A new import still falls back to the PDF.
+            if reprocessPrior[id] != nil { throw ImportError.arxivUnreachable }
+            fetched = nil
+        }
+        if let (html, finalURL) = fetched {
             try update(id, ctx, .converting, "Preparing clean text…")
             let result: IngestResult?
             do {
@@ -726,6 +811,10 @@ final class Importer: ObservableObject {
             }
         }
 
+        if keepHTML {
+            throw ImportError.wouldDowngrade("arXiv's HTML text for this paper couldn't be processed.")
+        }
+
         // No usable LaTeXML HTML: fall back to the PDF.
         if try require(id, ctx).hasPDF == false {
             try update(id, ctx, .fetching, "Downloading PDF…")
@@ -740,13 +829,19 @@ final class Importer: ObservableObject {
     private func fetchArxivHTML(_ arxivId: String) async throws -> (String, URL)? {
         let candidates = ["https://arxiv.org/html/\(arxivId)",
                           "https://ar5iv.labs.arxiv.org/html/\(arxivId)"]
+        // Set when a candidate could not answer (transport error, 408/429/5xx) rather than
+        // answering "no LaTeXML HTML here".
+        var transient = false
         for c in candidates {
             try Task.checkCancellation()
             guard let url = URL(string: c) else { continue }
             do {
                 let (data, response) = try await HTTP.get(url, maxBytes: HTTP.maxHTMLBytes,
                                                           headers: ["Accept": "text/html"])
-                guard response.statusCode == 200 else { continue }
+                guard response.statusCode == 200 else {
+                    if [408, 425, 429].contains(response.statusCode) || response.statusCode >= 500 { transient = true }
+                    continue
+                }
                 let finalURL = response.url ?? url
                 guard HTTP.isAllowed(finalURL) else { continue }
                 // Decoding and scanning up to 25 MB stays off the main actor.
@@ -759,15 +854,20 @@ final class Importer: ObservableObject {
             } catch is CancellationError {
                 throw CancellationError()
             } catch {
+                transient = true
                 continue
             }
         }
+        if transient { throw ImportError.arxivUnreachable }
         return nil
     }
 
     // 3. PDF path: Claude conversion, else local extraction.
     private func pdfPath(_ id: UUID, _ ctx: ModelContext, hints: PDFIdentityHints?) async throws {
         let p = try require(id, ctx)
+        if reprocessing.contains(id), reprocessPrior[id]?.kind == .arxivHTML {
+            throw ImportError.wouldDowngrade(nil)
+        }
         guard p.hasPDF else { throw ImportError.missingPDF }
 
         try update(id, ctx, .converting, "Checking PDF…")
@@ -844,6 +944,12 @@ final class Importer: ObservableObject {
     /// Offline fallback: PDFKit text → simple Markdown → the normal Markdown ingest.
     private func localExtraction(_ id: UUID, _ ctx: ModelContext, hints: PDFIdentityHints?,
                                  problem: String?) async throws {
+        // Reprocess of a paper with better text (arXiv HTML or a Claude conversion): plain
+        // PDFKit text would replace it with garbled equations. Keep what is there.
+        if reprocessing.contains(id), let prior = reprocessPrior[id],
+           prior.kind == .arxivHTML || prior.detail != Self.localExtractionDetail {
+            throw ImportError.wouldDowngrade(problem)
+        }
         try update(id, ctx, .converting, "Extracting text from the PDF…")
         let p = try require(id, ctx)
         let knownTitle = provisionalTitles.contains(id) || isPlaceholderTitle(p) ? hints?.titleGuess : p.title
@@ -1122,8 +1228,9 @@ final class Importer: ObservableObject {
     /// byte-identical PDF (SHA-256, cached in a sidecar next to each original.pdf).
     private func duplicates(of id: UUID, _ ctx: ModelContext) async throws -> [Paper] {
         let p = try require(id, ctx)
-        let base = p.arxivId.map(ArxivID.stripVersion)
-        let doi = p.doi?.lowercased()
+        let weak = weakIdentity.contains(id)
+        let base = weak ? nil : p.arxivId.map(ArxivID.stripVersion)
+        let doi = weak ? nil : p.doi?.lowercased()
         let others = ((try? ctx.fetch(FetchDescriptor<Paper>())) ?? []).filter { $0.id != id && !$0.isDeleted }
         var found: [UUID] = others.filter { o in
             if let base, let a = o.arxivId, ArxivID.stripVersion(a) == base { return true }
@@ -1365,7 +1472,26 @@ enum TitleMatch {
         return 1 - Double(prev[y.count]) / Double(longest)
     }
 
-    static func matches(_ a: String, _ b: String) -> Bool { similarity(a, b) >= acceptThreshold }
+    static func matches(_ a: String, _ b: String) -> Bool {
+        similarity(a, b) >= acceptThreshold && versionTokens(a) == versionTokens(b)
+    }
+
+    private static let romans: Set<String> = ["ii", "iii", "iv", "vi", "vii", "viii", "ix", "xi", "xii"]
+
+    /// Digit runs and roman numerals (II…XII) in a title, in order: what tells sibling papers
+    /// apart ("Qwen2.5" → ["2", "5"], "Gemma 3" → ["3"], "Part II" → ["ii"]).
+    static func versionTokens(_ s: String) -> [String] {
+        var out: [String] = []
+        for w in words(s) {
+            if romans.contains(w) { out.append(w); continue }
+            var run = ""
+            for ch in w {
+                if ch.isNumber { run.append(ch) } else if !run.isEmpty { out.append(run); run = "" }
+            }
+            if !run.isEmpty { out.append(run) }
+        }
+        return out.map { $0.count > 1 && $0.hasPrefix("0") ? String($0.drop(while: { $0 == "0" })) : $0 }
+    }
 }
 
 /// One text line of a PDF page with its font sizes (from `PDFPage.attributedString`).
@@ -1565,6 +1691,7 @@ enum PDFIdentity {
 
         var text = ""
         var headerText = ""
+        var marginStamp: String?
         for i in 0..<min(2, doc.pageCount) {
             guard let page = doc.page(at: i) else { continue }
             let s = page.string ?? ""
@@ -1578,9 +1705,15 @@ enum PDFIdentity {
             for (j, l) in lines.enumerated()
             where j < 4 || j >= lines.count - 4 || (body > 0 && l.size >= body * 1.5) {
                 headerText += l.text + "\n"
+                // arXiv's margin stamp: a short line on page 1 set much larger than the body.
+                if i == 0, marginStamp == nil, body > 0, l.size >= body * 1.5, l.text.count <= 80 {
+                    marginStamp = ArxivID.findStamp(l.text)
+                }
             }
         }
-        if h.stampArxiv == nil { h.stampArxiv = ArxivID.findStamp(text) }
+        // Trusted only in its margin-stamp form; any other "arXiv:… [cs]" on pages 1–2 may be a
+        // cited preprint and stays an unconfirmed candidate.
+        if h.stampArxiv == nil { h.stampArxiv = marginStamp ?? ArxivID.findDatedStamp(text) }
 
         var candidates = ArxivID.findAllInText(headerText)
         for id in ArxivID.findAllInText(text) where !candidates.contains(id) { candidates.append(id) }
@@ -1970,6 +2103,12 @@ struct PDFIdentityResolution: Sendable {
     var s2: S2Paper?
     var arxiv: ArxivEntry?
     var source: Source
+    /// The PDF's own metadata DOI (not one found in the text).
+    var trustedDOI = false
+
+    /// Identity the PDF states about itself (arXiv metadata / margin stamp, its own DOI
+    /// metadata): strong enough to fold it into an existing library paper.
+    var isStrong: Bool { source == .stamp || (source == .doi && trustedDOI) }
 }
 
 /// Identifies a dropped PDF before anything is paid for: (a) arXiv metadata / margin stamp,
@@ -2013,7 +2152,8 @@ enum PDFIdentityResolver {
             try Task.checkCancellation()
             let trusted = doi == h.metadataDOI
             guard trusted || (m.cleanTitle.map { confirms($0, h) } ?? false) else { continue }
-            return PDFIdentityResolution(arxivId: validArxiv(m.externalIds?.arXiv), doi: doi, s2: m, source: .doi)
+            return PDFIdentityResolution(arxivId: validArxiv(m.externalIds?.arXiv), doi: doi, s2: m, source: .doi,
+                                         trustedDOI: trusted)
         }
 
         // (c) Title search.
@@ -2021,7 +2161,7 @@ enum PDFIdentityResolver {
         try Task.checkCancellation()
         await status("Searching for the title…")
         var s2Hit: S2Paper?
-        if let m = try? await ScholarAPI.matchPaper(title: title), let t = m.cleanTitle, TitleMatch.matches(t, title) {
+        if let m = try? await ScholarAPI.matchPaper(title: title), let t = m.cleanTitle, titleHitAccepted(t, title, h) {
             if let ax = validArxiv(m.externalIds?.arXiv) {
                 return PDFIdentityResolution(arxivId: ax, doi: m.externalIds?.doi.flatMap(DOIParser.normalize),
                                              s2: m, source: .title)
@@ -2032,7 +2172,7 @@ enum PDFIdentityResolver {
         await status("Searching arXiv for the title…")
         if let entries = try? await ArxivAPI.search(title: title),
            let e = entries.max(by: { TitleMatch.similarity($0.title, title) < TitleMatch.similarity($1.title, title) }),
-           TitleMatch.matches(e.title, title) {
+           titleHitAccepted(e.title, title, h) {
             return PDFIdentityResolution(arxivId: ArxivID.stripVersion(e.id),
                                          doi: s2Hit?.externalIds?.doi.flatMap(DOIParser.normalize) ?? e.doi,
                                          s2: s2Hit, arxiv: e, source: .title)
@@ -2044,11 +2184,23 @@ enum PDFIdentityResolver {
         return nil
     }
 
-    /// A looked-up title belongs to this PDF if it is printed on page 1 or matches the PDF's
-    /// own title.
+    /// A looked-up title (of an arXiv id / DOI mentioned in the text) belongs to this PDF if it
+    /// matches the PDF's own title. Appearing somewhere on page 1 is not enough when the PDF
+    /// has a title of its own: "Notes on X", a review of X, or a reference list all print X.
     static func confirms(_ title: String, _ h: PDFIdentityHints) -> Bool {
-        if TitleMatch.text(h.firstPage, containsTitle: title) { return true }
-        return [h.metadataTitle, h.layoutTitle].contains { $0.map { TitleMatch.matches($0, title) } ?? false }
+        let own = [h.metadataTitle, h.layoutTitle].compactMap { $0 }
+        if own.contains(where: { TitleMatch.matches($0, title) }) { return true }
+        if own.isEmpty { return TitleMatch.text(h.firstPage, containsTitle: title) }
+        return false
+    }
+
+    /// A title-search hit is this PDF: the hit's title is printed on page 1 word for word and
+    /// matches the searched title, or matches it very closely. Version numbers must agree
+    /// ("Qwen3" ≠ "Qwen2", "Part II" ≠ "Part I") — see TitleMatch.matches.
+    static func titleHitAccepted(_ hit: String, _ searched: String, _ h: PDFIdentityHints) -> Bool {
+        guard TitleMatch.matches(hit, searched) else { return false }
+        if TitleMatch.text(h.firstPage, containsTitle: hit) { return true }
+        return TitleMatch.similarity(hit, searched) >= 0.95
     }
 
     private static func validArxiv(_ raw: String?) -> String? {
