@@ -302,10 +302,27 @@ final class Importer: ObservableObject {
     /// What a reprocessed paper had before (text kind, status detail): a failed Reprocess
     /// restores it instead of hiding intact text behind "Import failed", and Reprocess never
     /// replaces text with a lower-fidelity kind.
-    private var reprocessPrior: [UUID: (kind: ContentKind, detail: String?)] = [:]
-    /// Papers identified only by weak evidence (an arXiv mention, a DOI in the text, a title
-    /// search): never auto-merged into an existing paper on that identity.
-    private var weakIdentity: Set<UUID> = []
+    private var reprocessPrior: [UUID: (kind: ContentKind, detail: String?, identity: IdentitySnapshot)] = [:]
+
+    /// Identity and metadata of a paper before Reprocess: restored when the Reprocess fails,
+    /// so the old text is never shown under another paper's id, title and authors.
+    struct IdentitySnapshot {
+        var arxivId: String?, sourceURL: String?, doi: String?, s2PaperId: String?
+        var title: String, authors: [String], year: Int?, abstractText: String
+        var weakIdentity: Bool?
+
+        init(_ p: Paper) {
+            arxivId = p.arxivId; sourceURL = p.sourceURL; doi = p.doi; s2PaperId = p.s2PaperId
+            title = p.title; authors = p.authors; year = p.year; abstractText = p.abstractText
+            weakIdentity = p.weakIdentity
+        }
+
+        func restore(to p: Paper) {
+            p.arxivId = arxivId; p.sourceURL = sourceURL; p.doi = doi; p.s2PaperId = s2PaperId
+            p.title = title; p.authors = authors; p.year = year; p.abstractText = abstractText
+            p.weakIdentity = weakIdentity
+        }
+    }
 
     /// Short user-facing notice (e.g. "Reprocess failed — kept the existing text").
     var onNotice: ((String) -> Void)?
@@ -453,7 +470,7 @@ final class Importer: ObservableObject {
         markTitleProvisionalIfUnidentified(paper)
         reprocessing.insert(id)
         if paper.importState == .ready, paper.contentKind != .none, Self.hasContentFiles(id) {
-            reprocessPrior[id] = (paper.contentKind, paper.importStatusDetail)
+            reprocessPrior[id] = (paper.contentKind, paper.importStatusDetail, IdentitySnapshot(paper))
         } else {
             reprocessPrior[id] = nil
         }
@@ -473,7 +490,6 @@ final class Importer: ObservableObject {
     func cancel(_ paperId: UUID) {
         reprocessing.remove(paperId)
         reprocessPrior[paperId] = nil
-        weakIdentity.remove(paperId)
         queue.removeAll { $0.id == paperId }
         refQueue.removeAll { $0.id == paperId }
         if current?.id == paperId { current?.task.cancel() }
@@ -584,7 +600,6 @@ final class Importer: ObservableObject {
         defer {
             reprocessing.remove(job.id)
             reprocessPrior[job.id] = nil
-            weakIdentity.remove(job.id)
         }
         do {
             try await pipeline(job.id, ctx)
@@ -601,6 +616,8 @@ final class Importer: ObservableObject {
             // readable and say why nothing changed.
             if p.contentKind != .none, Self.hasContentFiles(job.id) {
                 let prior = reprocessPrior[job.id]
+                prior?.identity.restore(to: p)
+                if prior != nil { provisionalTitles.remove(job.id) }
                 p.importState = .ready
                 p.importStatusDetail = prior?.detail
                 save(ctx)
@@ -679,7 +696,8 @@ final class Importer: ObservableObject {
                 }
                 // Only the PDF's own stamp/metadata is strong enough to fold it into an
                 // existing paper; a mention or a title search may be a different document.
-                if !r.isStrong { weakIdentity.insert(id) }
+                // Persisted, so a later Retry/Reprocess cannot merge on it either.
+                p.weakIdentity = r.isStrong ? nil : true
             }
             if let h = hints { applyPDFHints(h, to: p) }
             save(ctx)
@@ -692,6 +710,11 @@ final class Importer: ObservableObject {
                 PDFIdentity.hints(for: localPDF, fileStem: nil)
             }.value
             hints = h
+            if h.stampArxiv != nil {
+                // The PDF's own stamp is strong evidence.
+                p = try require(id, ctx)
+                p.weakIdentity = nil
+            }
             if let stamp = h.stampArxiv, let current = arxivId,
                ArxivID.stripVersion(stamp) != ArxivID.stripVersion(current) {
                 p = try require(id, ctx)
@@ -836,12 +859,9 @@ final class Importer: ObservableObject {
             try Task.checkCancellation()
             guard let url = URL(string: c) else { continue }
             do {
+                // HTTP.get throws HTTPError.status for every non-2xx answer.
                 let (data, response) = try await HTTP.get(url, maxBytes: HTTP.maxHTMLBytes,
                                                           headers: ["Accept": "text/html"])
-                guard response.statusCode == 200 else {
-                    if [408, 425, 429].contains(response.statusCode) || response.statusCode >= 500 { transient = true }
-                    continue
-                }
                 let finalURL = response.url ?? url
                 guard HTTP.isAllowed(finalURL) else { continue }
                 // Decoding and scanning up to 25 MB stays off the main actor.
@@ -853,7 +873,19 @@ final class Importer: ObservableObject {
                 return (html, finalURL)
             } catch is CancellationError {
                 throw CancellationError()
+            } catch let e as HTTPError {
+                switch e {
+                case .status(let code, _):
+                    // 404/410 and other 4xx: this host has no HTML for the paper.
+                    if [408, 425, 429].contains(code) || code >= 500 { transient = true }
+                case .invalidResponse:
+                    transient = true
+                case .insecureURL, .insecureRedirect, .tooLarge:
+                    break   // a definite answer: nothing usable here
+                }
+                continue
             } catch {
+                // Transport failure (offline, timeout, DNS, TLS).
                 transient = true
                 continue
             }
@@ -1228,7 +1260,7 @@ final class Importer: ObservableObject {
     /// byte-identical PDF (SHA-256, cached in a sidecar next to each original.pdf).
     private func duplicates(of id: UUID, _ ctx: ModelContext) async throws -> [Paper] {
         let p = try require(id, ctx)
-        let weak = weakIdentity.contains(id)
+        let weak = p.weakIdentity == true
         let base = weak ? nil : p.arxivId.map(ArxivID.stripVersion)
         let doi = weak ? nil : p.doi?.lowercased()
         let others = ((try? ctx.fetch(FetchDescriptor<Paper>())) ?? []).filter { $0.id != id && !$0.isDeleted }
@@ -1271,8 +1303,7 @@ final class Importer: ObservableObject {
                 let rb = (b.importState == .ready ? 2 : 0) + (hasUserData(b, ctx) ? 1 : 0)
                 return ra != rb ? ra > rb : a.addedAt < b.addedAt
             }[0]
-            await merge(p, into: keep, ctx)
-            return true
+            return await merge(p, into: keep, ctx)
         }
         for d in dups {
             let did = d.id
@@ -1287,7 +1318,8 @@ final class Importer: ObservableObject {
 
     /// Removes `p` (a fresh duplicate with no user data) in favour of `keep`, handing over its
     /// PDF and identifiers when `keep` lacks them, and retrying `keep` if it had failed.
-    private func merge(_ p: Paper, into keep: Paper, _ ctx: ModelContext) async {
+    /// Returns false (and leaves `p` intact) if `keep` vanished meanwhile.
+    private func merge(_ p: Paper, into keep: Paper, _ ctx: ModelContext) async -> Bool {
         let from = p.id, to = keep.id
         if p.hasPDF, !keep.hasPDF {
             let src = PaperStore.pdfURL(from), dst = PaperStore.pdfURL(to)
@@ -1303,9 +1335,22 @@ final class Importer: ObservableObject {
                     return false
                 }
             }.value
-            if moved, let k = paper(to, ctx) { k.hasPDF = true }
+            if moved {
+                if let k = paper(to, ctx) {
+                    k.hasPDF = true
+                } else {
+                    // `keep` was deleted during the move: give the PDF back to `p`.
+                    let back: Bool = await Task.detached(priority: .utility) {
+                        guard !FileManager.default.fileExists(atPath: src.path) else { return true }
+                        try? FileManager.default.createDirectory(at: src.deletingLastPathComponent(),
+                                                                 withIntermediateDirectories: true)
+                        return (try? FileManager.default.moveItem(at: dst, to: src)) != nil
+                    }.value
+                    if !back, let me = paper(from, ctx) { me.hasPDF = false; save(ctx) }
+                }
+            }
         }
-        guard let keep = paper(to, ctx) else { return }
+        guard let keep = paper(to, ctx), let p = paper(from, ctx) else { return false }
         if keep.arxivId == nil, let a = p.arxivId { keep.arxivId = a }
         if keep.doi == nil, let d = p.doi { keep.doi = d }
         onRedirect?(from, to, "This paper is already in your library.")
@@ -1316,6 +1361,7 @@ final class Importer: ObservableObject {
         PaperStore.delete(p, in: ctx)
         save(ctx)
         if keep.importState == .failed, !activeIds.contains(to) { retry(keep, context: ctx) }
+        return true
     }
 
     private func isPlaceholderTitle(_ p: Paper) -> Bool {
@@ -1473,7 +1519,27 @@ enum TitleMatch {
     }
 
     static func matches(_ a: String, _ b: String) -> Bool {
-        similarity(a, b) >= acceptThreshold && versionTokens(a) == versionTokens(b)
+        similarity(a, b) >= acceptThreshold && versionTokens(a) == versionTokens(b) && !swapsShortWord(a, b)
+    }
+
+    /// Whether the titles differ in a short word ("A Survey on X" vs "A Survey of X",
+    /// "… for Y" vs "… in Y", "A Survey" vs "The Survey"): a different title, not a typo. Only
+    /// decidable when both titles split into the same number of words (PDF text that lost its
+    /// spaces is left to the similarity ratio).
+    static func swapsShortWord(_ a: String, _ b: String) -> Bool {
+        let x = words(a), y = words(b)
+        if x.count == y.count {
+            return zip(x, y).contains { $0 != $1 && min($0.count, $1.count) <= 3 }
+        }
+        // A short word added or dropped ("…: Survey" vs "…: A Survey").
+        let (long, short) = x.count > y.count ? (x, y) : (y, x)
+        guard long.count == short.count + 1 else { return false }
+        for i in 0..<long.count where long[i].count <= 3 {
+            var rest = long
+            rest.remove(at: i)
+            if rest == short { return true }
+        }
+        return false
     }
 
     private static let romans: Set<String> = ["ii", "iii", "iv", "vi", "vii", "viii", "ix", "xi", "xii"]
@@ -2161,7 +2227,7 @@ enum PDFIdentityResolver {
         try Task.checkCancellation()
         await status("Searching for the title…")
         var s2Hit: S2Paper?
-        if let m = try? await ScholarAPI.matchPaper(title: title), let t = m.cleanTitle, titleHitAccepted(t, title, h) {
+        if let m = try? await ScholarAPI.matchPaper(title: title), let t = m.cleanTitle, titleHitAccepted(t, title, hitAuthors: m.authorNames, h) {
             if let ax = validArxiv(m.externalIds?.arXiv) {
                 return PDFIdentityResolution(arxivId: ax, doi: m.externalIds?.doi.flatMap(DOIParser.normalize),
                                              s2: m, source: .title)
@@ -2171,8 +2237,8 @@ enum PDFIdentityResolver {
         try Task.checkCancellation()
         await status("Searching arXiv for the title…")
         if let entries = try? await ArxivAPI.search(title: title),
-           let e = entries.max(by: { TitleMatch.similarity($0.title, title) < TitleMatch.similarity($1.title, title) }),
-           titleHitAccepted(e.title, title, h) {
+           let e = entries.sorted(by: { TitleMatch.similarity($0.title, title) > TitleMatch.similarity($1.title, title) })
+               .first(where: { titleHitAccepted($0.title, title, hitAuthors: $0.authors, h) }) {
             return PDFIdentityResolution(arxivId: ArxivID.stripVersion(e.id),
                                          doi: s2Hit?.externalIds?.doi.flatMap(DOIParser.normalize) ?? e.doi,
                                          s2: s2Hit, arxiv: e, source: .title)
@@ -2197,10 +2263,59 @@ enum PDFIdentityResolver {
     /// A title-search hit is this PDF: the hit's title is printed on page 1 word for word and
     /// matches the searched title, or matches it very closely. Version numbers must agree
     /// ("Qwen3" ≠ "Qwen2", "Part II" ≠ "Part I") — see TitleMatch.matches.
-    static func titleHitAccepted(_ hit: String, _ searched: String, _ h: PDFIdentityHints) -> Bool {
+    /// The hit's authors must also agree with the PDF: a title alone does not identify a paper
+    /// (surveys and position papers often share near-identical titles).
+    static func titleHitAccepted(_ hit: String, _ searched: String, hitAuthors: [String],
+                                 _ h: PDFIdentityHints) -> Bool {
         guard TitleMatch.matches(hit, searched) else { return false }
-        if TitleMatch.text(h.firstPage, containsTitle: hit) { return true }
-        return TitleMatch.similarity(hit, searched) >= 0.95
+        guard TitleMatch.text(h.firstPage, containsTitle: hit)
+                || TitleMatch.similarity(hit, searched) >= 0.95 else { return false }
+        switch authorsAgree(hitAuthors, h) {
+        case true?: return true
+        case false?: return false
+        case nil:
+            // Nothing to compare (no author list on either side): only an exact title printed
+            // on page 1 is enough.
+            return TitleMatch.similarity(hit, searched) == 1 && TitleMatch.text(h.firstPage, containsTitle: hit)
+        }
+    }
+
+    /// true: a surname of the hit's authors appears in the PDF's author metadata or in the
+    /// header of page 1 (before the abstract, so cited names do not count); false: the PDF
+    /// has author information and none matches; nil: nothing to compare.
+    static func authorsAgree(_ hitAuthors: [String], _ h: PDFIdentityHints) -> Bool? {
+        let surnames = Set(hitAuthors.prefix(50).compactMap(surname))
+        guard !surnames.isEmpty else { return nil }
+        let metaWords = Set(h.metadataAuthors.flatMap { TitleMatch.words($0) })
+        let header = pageHeader(h.firstPage)
+        let headerWords = Set(TitleMatch.words(header))
+        let headerCompact = headerWords.isEmpty ? "" : TitleMatch.words(header).joined()
+        guard !metaWords.isEmpty || !headerWords.isEmpty else { return nil }
+        for s in surnames {
+            if metaWords.contains(s) || headerWords.contains(s) { return true }
+            // Text that lost its spaces ("WayneXinZhao").
+            if s.count >= 4, headerCompact.contains(s) { return true }
+        }
+        return false
+    }
+
+    /// Lowercased, folded family name: "Zhao, Wayne Xin" → "zhao", "Wayne Xin Zhao" → "zhao".
+    static func surname(_ name: String) -> String? {
+        let family = name.contains(",") ? String(name.split(separator: ",")[0]) : name
+        let w = TitleMatch.words(family)
+        guard let last = w.last, last.count >= 2 else { return nil }
+        return last
+    }
+
+    /// Page-1 text up to the abstract / introduction (where titles and author names sit).
+    static func pageHeader(_ page: String) -> String {
+        let lower = page.lowercased()
+        var end = lower.endIndex
+        for marker in ["abstract", "introduction"] {
+            if let r = lower.range(of: marker), r.lowerBound < end { end = r.lowerBound }
+        }
+        let cut = lower.distance(from: lower.startIndex, to: end)
+        return String(page.prefix(min(cut, 3000)))
     }
 
     private static func validArxiv(_ raw: String?) -> String? {

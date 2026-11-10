@@ -495,6 +495,101 @@
     placeBlock(svg, box, root);
   }
 
+  // Accents drawn over a single character (mover) → combining characters.
+  const COMBINING_ACCENT = {
+    '\u00AF': '\u0304', '\u203E': '\u0305', '\u2015': '\u0305', '\u0332': '\u0305', '_': '\u0305',
+    '^': '\u0302', '\u02C6': '\u0302', '~': '\u0303', '\u02DC': '\u0303', '\u02D9': '\u0307',
+    '\u00A8': '\u0308', '\u02C7': '\u030C', '\u00B4': '\u0301', '`': '\u0300', '\u02D8': '\u0306',
+    '\u2192': '\u20D7', '\u20D7': '\u20D7',
+  };
+  const ITALIC_LETTER_RE = /^[A-Za-z\u03B1-\u03C9\u0391-\u03A9]$/;
+
+  /**
+   * A label's MathML/HTML as styled runs: [{ text, dy (em, relative to the baseline),
+   * scale, italic }]. Sub/superscripts are shifted and smaller, single-letter identifiers
+   * italic, over-accents become combining characters — so f_{r-1} does not read "fr−1".
+   */
+  function labelRuns(fo) {
+    const runs = [];
+    const push = (text, st) => {
+      text = text.replace(INVISIBLE_MATH_RE, '');
+      if (!text) return;
+      const last = runs[runs.length - 1];
+      if (last && last.dy === st.dy && last.scale === st.scale && last.italic === st.italic) last.text += text;
+      else runs.push({ text, dy: st.dy, scale: st.scale, italic: st.italic });
+    };
+    const script = (st, up) => {
+      const scale = Math.max(0.5, st.scale * 0.72);
+      return { dy: st.dy + (up ? -0.42 : 0.28) * st.scale, scale, italic: st.italic };
+    };
+    const kids = (el) => Array.from(el.children);
+    function walk(n, st, depth) {
+      if (depth > 60) return;
+      if (n.nodeType === 3) { push(n.data.replace(/[ \t\n\r\f]+/g, ' '), st); return; }
+      if (n.nodeType !== 1) return;
+      const tag = String(n.localName || '').toLowerCase();
+      const c = kids(n);
+      switch (tag) {
+        case 'annotation': case 'annotation-xml': case 'script': case 'style': return;
+        case 'mi': {
+          const t = n.textContent.trim();
+          const italic = ITALIC_LETTER_RE.test(t) && n.getAttribute('mathvariant') !== 'normal';
+          push(t, { dy: st.dy, scale: st.scale, italic });
+          return;
+        }
+        case 'mn': case 'mo': case 'mtext': case 'ms':
+          push(n.textContent.trim(), { dy: st.dy, scale: st.scale, italic: false });
+          return;
+        case 'mspace': push(' ', st); return;
+        case 'msub': case 'msup': case 'msubsup':
+          if (c.length < 2) break;
+          walk(c[0], st, depth + 1);
+          if (tag !== 'msup') walk(c[1], script(st, false), depth + 1);
+          if (tag === 'msup') walk(c[1], script(st, true), depth + 1);
+          if (tag === 'msubsup' && c[2]) walk(c[2], script(st, true), depth + 1);
+          return;
+        case 'mover': case 'munder': case 'munderover': {
+          if (c.length < 2) break;
+          const over = tag === 'mover' ? c[1] : tag === 'munderover' ? c[2] : null;
+          const base = c[0].textContent.replace(INVISIBLE_MATH_RE, '').trim();
+          const accent = over && COMBINING_ACCENT[over.textContent.trim()];
+          if (accent && Array.from(base).length === 1 && tag === 'mover') {
+            const b = c[0].localName === 'mi' && ITALIC_LETTER_RE.test(base) && c[0].getAttribute('mathvariant') !== 'normal';
+            push(base + accent, { dy: st.dy, scale: st.scale, italic: b });
+            return;
+          }
+          walk(c[0], st, depth + 1);
+          if (tag !== 'mover') walk(c[1], script(st, false), depth + 1);
+          if (over) walk(over, script(st, true), depth + 1);
+          return;
+        }
+        case 'mfrac':
+          if (c.length < 2) break;
+          walk(c[0], st, depth + 1); push('/', st); walk(c[1], st, depth + 1);
+          return;
+        case 'msqrt': push('\u221A(', st); c.forEach((k) => walk(k, st, depth + 1)); push(')', st); return;
+        case 'mroot':
+          if (c.length < 2) break;
+          walk(c[1], script(st, true), depth + 1); push('\u221A(', st); walk(c[0], st, depth + 1); push(')', st);
+          return;
+        case 'br': case 'p': case 'div': push(' ', st); break;
+        default: break;
+      }
+      for (let k = n.firstChild; k; k = k.nextSibling) walk(k, st, depth + 1);
+    }
+    walk(fo, { dy: 0, scale: 1, italic: false }, 0);
+    // trim and collapse spaces across runs
+    let prevSpace = true;
+    runs.forEach((r) => {
+      r.text = r.text.replace(/ +/g, ' ');
+      if (prevSpace) r.text = r.text.replace(/^ /, '');
+      if (r.text) prevSpace = r.text.endsWith(' ');
+    });
+    while (runs.length && runs[runs.length - 1].text.trim() === '') runs.pop();
+    if (runs.length) runs[runs.length - 1].text = runs[runs.length - 1].text.replace(/ $/, '');
+    return runs.filter((r) => r.text);
+  }
+
   /** foreignObject label → SVG <text> drawn where the label was (no HTML inside an image). */
   function labelToText(fo, xdoc) {
     const text = plainText(fo);
@@ -524,6 +619,25 @@
       });
       if (line) lines.push(line);
     } else {
+      // One line: keep the math structure (scripts, italics, accents).
+      const runs = fo.querySelector('math') ? labelRuns(fo) : [];
+      if (runs.length && runs.some((r) => r.dy || r.italic || r.scale !== 1 || /[\u0300-\u036F\u20D7]/.test(r.text))) {
+        const line = xdoc.createElementNS('http://www.w3.org/2000/svg', 'tspan');
+        line.setAttribute('x', String(x));
+        line.setAttribute('y', String(+(y + fs * 0.85).toFixed(2)));
+        let cur = 0;
+        runs.forEach((r) => {
+          const span = xdoc.createElementNS('http://www.w3.org/2000/svg', 'tspan');
+          if (r.dy !== cur) span.setAttribute('dy', String(+((r.dy - cur) * fs).toFixed(2)));
+          cur = r.dy;
+          if (r.scale !== 1) span.setAttribute('font-size', String(+(fs * r.scale).toFixed(2)));
+          if (r.italic) span.setAttribute('font-style', 'italic');
+          span.textContent = r.text;
+          line.appendChild(span);
+        });
+        t.appendChild(line);
+        return t;
+      }
       lines.push(text);
     }
     lines.forEach((ln, i) => {
@@ -828,6 +942,11 @@
     add('.ltx_bibitem', 'bibitem');
     add('.ltx_listing', 'listing');
     add('.ltx_listingline, .ltx_listing_line', 'line');
+    // Lines that are not lstlisting code (algorithmic pseudocode): their whitespace text nodes
+    // are LaTeXML source formatting, so they must not be kept verbatim.
+    root.querySelectorAll('.line').forEach((l) => {
+      if (!l.closest('.ltx_lstlisting') && !l.querySelector('[class*="ltx_lst_"]')) l.classList.add('alg');
+    });
     add('.ltx_algorithm, figure.ltx_float_algorithm', 'algo');
     add('.ltx_flex_figure', 'flexfig');
     add('.ltx_figure_panel, .ltx_flex_cell', 'panel');

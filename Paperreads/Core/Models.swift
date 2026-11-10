@@ -58,6 +58,9 @@ final class Paper {
     var pdfPageIndex: Int? = nil
     /// Last view mode the user chose for this paper: "text" | "pdf".
     var lastViewModeRaw: String? = nil
+    /// True when the arXiv id / DOI came only from weak evidence in a dropped PDF (an arXiv
+    /// mention, a DOI in the text, a title search): never auto-merged on that identity.
+    var weakIdentity: Bool? = nil
 
     init(title: String, sourceURL: String? = nil) {
         self.id = UUID()

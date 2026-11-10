@@ -46,7 +46,7 @@
     'm', 'eq', 'eqn', 'tex-fallback', 'cite', 'xref', 'tag', 'sc', 'theorem', 'proof',
     'runin', 'note', 'fnref', 'biblist', 'bibitem', 'listing', 'line', 'algo', 'flexfig',
     'panel', 'fig', 'tbl', 'tabular', 'c', 'l', 'r', 'rt', 'rb', 'tagged', 'ack', 'abstract',
-    'pre-wrap', 'box', 'box-title', 'diagram', 'm-alt',
+    'pre-wrap', 'box', 'box-title', 'diagram', 'm-alt', 'alg',
   ]);
 
   const MAX_DEPTH = 160;

@@ -229,8 +229,9 @@ code.tex-fallback {
 
 /* LaTeXML structures */
 .prose .theorem, .prose .proof { margin: 1.4em 0; }
-.prose .theorem p { font-style: italic; }
-.prose .theorem p.runin { font-style: normal; }
+/* Theorem bodies: LaTeXML marks plain-style (theorem/lemma) italics itself (ltx_font_italic → i);
+   definition/remark/example bodies stay upright. Emphasis inside italic text is upright. */
+.prose i em, .prose i i { font-style: normal; }
 .prose p.runin { margin-bottom: 0.35em; }
 .prose .proof p.runin strong { font-weight: 400; font-style: italic; }
 .prose p.note {
@@ -250,6 +251,9 @@ code.tex-fallback {
   border-left: 1.5px solid var(--hairline);
 }
 .prose .line { display: block; white-space: pre-wrap; }
+/* Algorithmic (not lstlisting) lines: LaTeXML's source indentation between the line number and
+   the statement is not content; indentation there is en spaces, which still render. */
+.prose .line.alg { white-space: normal; }
 .prose ul.biblist { list-style: none; padding-left: 0; font-size: 0.86em; line-height: 1.5; }
 .prose ul.biblist > li.bibitem { margin: 0 0 0.75em; padding-left: 2.6em; text-indent: -2.6em; }
 .prose ul.biblist > li.bibitem .tag { color: var(--faint); display: inline-block; min-width: 2.6em; text-indent: 0; }
