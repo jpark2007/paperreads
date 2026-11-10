@@ -1,0 +1,8 @@
+#!/bin/sh
+# Blocks commits that contain anything resembling an API key or private key.
+pattern='sk-ant-[A-Za-z0-9_-]{10,}|AKIA[0-9A-Z]{16}|ghp_[A-Za-z0-9]{30,}|-----BEGIN [A-Z ]*PRIVATE KEY-----|"apiKey"[[:space:]]*:[[:space:]]*"[^"]{8,}"'
+if git diff --cached -U0 --no-color | grep '^+' | grep -qE "$pattern"; then
+  echo "pre-commit: possible secret in staged changes — commit blocked." >&2
+  git diff --cached -U0 --no-color | grep '^+' | grep -nE "$pattern" | sed -E 's/(sk-ant-[A-Za-z0-9_-]{4})[A-Za-z0-9_-]+/\1…/g' >&2
+  exit 1
+fi

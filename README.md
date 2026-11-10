@@ -16,3 +16,6 @@ Add your Anthropic API key in Settings (⌘,), or set `ANTHROPIC_API_KEY`.
 select text → Highlight / Explain / Ask · ⌘E explain selection · ⌘⇧H highlight.
 
 Design and module contract: `docs/ARCHITECTURE.md`.
+
+## Secrets
+The API key is stored outside the repo (`~/Library/Application Support/Paperreads/config.json`, mode 0600) or read from `ANTHROPIC_API_KEY`. After cloning, run `git config core.hooksPath .githooks` to enable the pre-commit secret check.

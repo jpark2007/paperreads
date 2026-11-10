@@ -2,3 +2,13 @@ build/
 *.xcodeproj/
 .DS_Store
 xcuserdata/
+
+# Never commit secrets or local user data
+config.json
+.env
+.env.*
+*.store
+*.store-shm
+*.store-wal
+*.pem
+*.key
